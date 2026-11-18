@@ -1,31 +1,27 @@
 # deck
 
-A fast, responsive desktop audio player written in Rust and egui.
+A fast, hardware-accelerated desktop audio player built with Rust and egui. Play lossless audio with real-time speed adjustments and studio reverb without needing pre-rendered edits.
 
-## Why deck?
+## Preview
 
-Instead of downloading compressed, low-bitrate "sped up" or "slowed + reverb" edits of tracks from YouTube, `deck` lets you apply real-time speed adjustments and custom studio reverb directly on your existing lossless and high-res audio library—no separate downloads or re-renders needed.
+`deck` dynamically adapts its layout to your window dimensions—seamlessly transitioning between an expanded view with library management and a compact playback deck.
 
-## Adaptive Layout
-
-`deck` automatically reorganizes its layout based on window dimensions—seamlessly shifting between an expanded view with library details and a compact deck mode for minimal desktop footprints.
-
-| Expanded View | Compact View |
+| Full View | Compact View |
 | :---: | :---: |
-| ![Expanded Mode](docs/images/preview-full.png) | ![Compact Mode](docs/images/preview-compact.png) |
+| ![Full Mode](docs/images/preview-full.png) | ![Compact Mode](docs/images/preview-compact.png) |
 
 ## Features
 
-- **Real-Time DSP Engine**: Live playback speed scaling and warm studio hall reverb without quality degradation.
-- **Hardware-accelerated UI**: Immediate-mode GUI powered by `eframe` / `egui`.
-- **Low-latency playback**: Symphonia audio engine integration through `rodio`.
-- **Metadata parsing**: Tag and album art extraction via `lofty`.
-- **System media integration**: Native OS media controls powered by `souvlaki`.
-- **Responsive design**: Smooth adaptive transition between full library and compact playback views.
+- **Live DSP Engine**: Real-time speed scaling (sped up / slowed down) and studio hall reverb applied on the fly to high-res audio.
+- **Adaptive Layout**: Smooth, dynamic UI scaling that transitions from library view to minimal deck player based on window size.
+- **Hardware-Accelerated UI**: Immediate-mode GUI powered by `eframe` and `egui`.
+- **Low-Latency Playback**: High-performance audio pipeline using `rodio` and `symphonia`.
+- **Metadata & Album Art**: Automatic tag extraction and embedded artwork rendering via `lofty`.
+- **Native Media Controls**: System integration (media keys and notifications) via `souvlaki`.
 
 ## Building from Source
 
-Ensure [Rust](https://rustup.rs/) is installed:
+Prerequisites: [Rust & Cargo](https://rustup.rs/)
 
 ```bash
 git clone https://github.com/ye6isu/deck.git
