@@ -1,0 +1,33 @@
+[package]
+name = "deck"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = "0.27"
+eframe = "0.27"
+egui_extras = { version = "0.27", features = ["all_loaders"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.14"
+rand = "0.8"
+
+# Audio Decoding & Playback
+rodio = { version = "=0.22.2", default-features = false, features = ["playback", "symphonia-all"] }
+
+# Metadata & Tag extraction
+lofty = "0.18"
+
+# Concurrency & IPC
+crossbeam-channel = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+windows-sys = { version = "0.61.2", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+souvlaki = "0.9.3"
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
