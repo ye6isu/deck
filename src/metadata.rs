@@ -1,4 +1,4 @@
-use lofty::{read_from_path, AudioFile, TaggedFileExt, Accessor};
+use lofty::{read_from_path, AudioFile, TaggedFileExt, Accessor, ItemKey};
 use std::path::Path;
 
 #[derive(Clone, Default)]
@@ -9,6 +9,7 @@ pub struct TrackMetadata {
     pub duration_secs: f64,
     pub duration_str: String,
     pub cover_image: Option<Vec<u8>>,
+    pub lyrics: Option<String>,
 }
 
 pub fn extract_metadata(path: &Path) -> TrackMetadata {
@@ -28,6 +29,7 @@ fn extract_metadata_internal(path: &Path, include_cover: bool) -> TrackMetadata 
         duration_secs: 0.0,
         duration_str: "--:--".to_string(),
         cover_image: None,
+        lyrics: None,
     };
 
     if let Ok(tagged_file) = read_from_path(path) {
@@ -60,6 +62,55 @@ fn extract_metadata_internal(path: &Path, include_cover: bool) -> TrackMetadata 
             if include_cover {
                 if let Some(pic) = tag.pictures().first() {
                     meta.cover_image = Some(pic.data().to_vec());
+                }
+            }
+            if let Some(lyrics_str) = tag.get_string(&ItemKey::Lyrics) {
+                let trimmed = lyrics_str.trim();
+                if !trimmed.is_empty() {
+                    meta.lyrics = Some(trimmed.to_string());
+                }
+            }
+        }
+
+        // Also check all tags or ID3v2 USLT frames if lyrics not found yet
+        if meta.lyrics.is_none() {
+            for tag in tagged_file.tags() {
+                if let Some(lyrics_str) = tag.get_string(&ItemKey::Lyrics) {
+                    let trimmed = lyrics_str.trim();
+                    if !trimmed.is_empty() {
+                        meta.lyrics = Some(trimmed.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also check ID3v2 unsync_text specifically if available
+        if meta.lyrics.is_none() {
+            if let Some(id3_tag) = tagged_file.tag(lofty::TagType::Id3v2) {
+                for item in id3_tag.items() {
+                    if item.key() == &ItemKey::Lyrics {
+                        if let Some(val) = item.value().text() {
+                            let trimmed = val.trim();
+                            if !trimmed.is_empty() {
+                                meta.lyrics = Some(trimmed.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also support external .lrc file beside the audio file if embedded lyrics are absent
+    if meta.lyrics.is_none() {
+        let lrc_path = path.with_extension("lrc");
+        if lrc_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&lrc_path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    meta.lyrics = Some(trimmed.to_string());
                 }
             }
         }

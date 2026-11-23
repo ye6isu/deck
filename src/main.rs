@@ -15,6 +15,13 @@ use theme::WarmIndustrialTheme;
 use metadata::TrackMetadata;
 use audio_engine::{AudioEngine, AudioCommand};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatingControlType {
+    Volume,
+    Speed,
+    Reverb,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlaylistItem {
     pub id: usize,
@@ -40,7 +47,19 @@ pub struct SavedConfig {
     pub appearance: u8,
     #[serde(default)]
     pub accent_color: u8,
+    #[serde(default = "default_lyrics_size")]
+    pub lyrics_size: f32,
+    #[serde(default = "default_lyrics_spacing")]
+    pub lyrics_spacing: f32,
+    #[serde(default = "default_lyrics_context")]
+    pub lyrics_context: u8, // e.g. 2 lines before & 2 lines after (total 5)
+    #[serde(default)]
+    pub lyrics_align: u8, // 0 = Center, 1 = Left, 2 = Right
 }
+
+fn default_lyrics_size() -> f32 { 18.0 }
+fn default_lyrics_spacing() -> f32 { 14.0 }
+fn default_lyrics_context() -> u8 { 2 }
 
 impl Default for SavedConfig {
     fn default() -> Self {
@@ -56,6 +75,10 @@ impl Default for SavedConfig {
             playback_order: Vec::new(),
             appearance: 0,
             accent_color: 0,
+            lyrics_size: 18.0,
+            lyrics_spacing: 14.0,
+            lyrics_context: 2,
+            lyrics_align: 0,
         }
     }
 }
@@ -106,6 +129,20 @@ pub struct DeckApp {
     speed_open: bool,
     reverb_open: bool,
 
+    // Lyrics view state
+    lyrics_open: bool,
+    lyrics_scroll_offset: f32, // smoothly animated visual line position (float)
+    lyrics_user_offset: f32,   // manual scroll offset in lines relative to active line
+    lyrics_user_scroll_timer: f32, // countdown timer (seconds) before snapping back to active line
+    lyrics_size: f32,
+    lyrics_spacing: f32,
+    lyrics_context: u8,
+    lyrics_align: u8,
+
+    // Vertical floating preview popup (on hover or scroll of volume, speed, reverb)
+    active_floating_control: Option<FloatingControlType>,
+    floating_control_timer: f32,
+
     // Playhead scrubbing state
     is_scrubbing: bool,
     audio_revision: u64,
@@ -118,10 +155,160 @@ pub struct DeckApp {
     media_controls: Option<souvlaki::MediaControls>,
     media_rx: Option<crossbeam_channel::Receiver<souvlaki::MediaControlEvent>>,
     smtc_inited: bool,
+    bg_tx: Option<crossbeam_channel::Sender<crossbeam_channel::Sender<bool>>>,
 }
 
 fn duration_seconds(value: &str) -> u32 {
     value.split(':').filter_map(|v| v.parse::<u32>().ok()).fold(0, |total, n| total * 60 + n)
+}
+
+#[derive(Clone, Debug)]
+pub struct LyricLine {
+    pub time_secs: Option<f64>,
+    pub text: String,
+}
+
+fn parse_timestamp_tag(tag: &str) -> Option<f64> {
+    let parts: Vec<&str> = tag.split(':').collect();
+    if parts.len() == 2 {
+        if let (Ok(m), Ok(s)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+            return Some(m * 60.0 + s);
+        }
+    }
+    None
+}
+
+fn strip_lyric_prefixes(s: &str) -> &str {
+    let mut cur = s.trim();
+    // Strip prefixes like "v1:", "v2:", "p1:", "c1:", "ch:", "v1 ", etc.
+    let prefixes = ["v1:", "v2:", "v3:", "v4:", "p1:", "p2:", "c1:", "c2:", "ch:", "v1", "v2"];
+    for p in prefixes {
+        if cur.to_lowercase().starts_with(p) {
+            let rem = &cur[p.len()..];
+            cur = rem.trim_start_matches(':').trim();
+        }
+    }
+    cur
+}
+
+fn strip_word_timestamps(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_bracket = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_bracket = true;
+        } else if ch == '>' {
+            in_bracket = false;
+        } else if !in_bracket {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn strip_metadata_headers(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    // Standard ID tags in LRC files: [ti:Title], [ar:Artist], [al:Album], [by:...], [offset:...], [length:...], [re:...], [ve:...]
+    for tag in ["[ti:", "[ar:", "[al:", "[by:", "[offset:", "[length:", "[re:", "[ve:"] {
+        if lower.starts_with(tag) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_background_vocal_content(s: &str) -> Option<String> {
+    let cur = s.trim();
+    if cur.to_lowercase().starts_with("[bg:") {
+        if let Some(close) = cur.rfind(']') {
+            let inner = cur[4..close].trim();
+            let clean = if inner.starts_with('(') && inner.ends_with(')') {
+                inner[1..inner.len() - 1].trim()
+            } else {
+                inner
+            };
+            return Some(format!("({})", clean));
+        }
+    }
+    None
+}
+
+pub fn parse_lrc_lines(raw: &str) -> Vec<LyricLine> {
+    let mut lines: Vec<LyricLine> = Vec::new();
+    for line in raw.lines() {
+        let mut trimmed = line.trim();
+        if trimmed.is_empty() || strip_metadata_headers(trimmed) {
+            continue;
+        }
+
+        // Check if the raw line is a standalone background vocal tag: e.g. [bg:<00:06.46>(Rock it)<...>]
+        let is_bg_line = trimmed.to_lowercase().starts_with("[bg:");
+        if is_bg_line {
+            let stripped_words = strip_word_timestamps(trimmed);
+            if let Some(bg_text) = extract_background_vocal_content(&stripped_words) {
+                if !bg_text.is_empty() {
+                    // Append background vocal to previous line if one exists
+                    if let Some(prev) = lines.last_mut() {
+                        prev.text.push(' ');
+                        prev.text.push_str(&bg_text);
+                    } else {
+                        lines.push(LyricLine {
+                            time_secs: None,
+                            text: bg_text,
+                        });
+                    }
+                }
+                continue;
+            }
+        }
+
+        // 1. Strip voice/section tag if present at start (e.g. "v1:")
+        trimmed = strip_lyric_prefixes(trimmed);
+
+        let mut time_secs = None;
+        let mut remaining_text = trimmed;
+
+        // 2. Check for standard line timestamp at beginning: [mm:ss.xx]
+        if remaining_text.starts_with('[') {
+            if let Some(close_bracket) = remaining_text.find(']') {
+                let time_part = &remaining_text[1..close_bracket];
+                if let Some(ts) = parse_timestamp_tag(time_part) {
+                    time_secs = Some(ts);
+                    remaining_text = remaining_text[close_bracket + 1..].trim();
+                }
+            }
+        }
+
+        // Also check if line timestamp is in enhanced format <mm:ss.xxx> at the beginning
+        if time_secs.is_none() && remaining_text.starts_with('<') {
+            if let Some(close_bracket) = remaining_text.find('>') {
+                let time_part = &remaining_text[1..close_bracket];
+                if let Some(ts) = parse_timestamp_tag(time_part) {
+                    time_secs = Some(ts);
+                    remaining_text = remaining_text[close_bracket + 1..].trim();
+                }
+            }
+        }
+
+        // 3. Strip voice prefix again if it was inside the timestamp: e.g. [01:23.45]v1: ...
+        remaining_text = strip_lyric_prefixes(remaining_text);
+
+        // 4. Strip any inline word-level timestamps <mm:ss.xxx>
+        let clean_text = strip_word_timestamps(remaining_text);
+        let final_text = if let Some(bg_text) = extract_background_vocal_content(&clean_text) {
+            bg_text
+        } else {
+            clean_text.trim().to_string()
+        };
+
+        if !final_text.is_empty() {
+            lines.push(LyricLine {
+                time_secs,
+                text: final_text,
+            });
+        }
+    }
+    lines
 }
 
 fn dismiss_popup(ctx: &egui::Context, popup: Rect, anchor: Rect) -> bool {
@@ -213,6 +400,16 @@ impl DeckApp {
             metadata_rx: None,
             speed_open: false,
             reverb_open: false,
+            lyrics_open: false,
+            lyrics_scroll_offset: 0.0,
+            lyrics_user_offset: 0.0,
+            lyrics_user_scroll_timer: 0.0,
+            lyrics_size: saved.lyrics_size,
+            lyrics_spacing: saved.lyrics_spacing,
+            lyrics_context: saved.lyrics_context,
+            lyrics_align: saved.lyrics_align,
+            active_floating_control: None,
+            floating_control_timer: 0.0,
             is_scrubbing: false,
             audio_revision: 0,
             audio_error: None,
@@ -220,6 +417,7 @@ impl DeckApp {
             media_controls: None,
             media_rx: None,
             smtc_inited: false,
+            bg_tx: None,
         };
 
         if let Some(folder) = app.library_folder.clone() {
@@ -268,6 +466,10 @@ impl DeckApp {
             playback_order: self.shuffle_order.iter().filter_map(|&i| self.playlist.get(i).map(|t| t.path.clone())).collect(),
             appearance: self.appearance,
             accent_color: self.accent_color,
+            lyrics_size: self.lyrics_size,
+            lyrics_spacing: self.lyrics_spacing,
+            lyrics_context: self.lyrics_context,
+            lyrics_align: self.lyrics_align,
         };
         save_state(&cfg);
     }
@@ -304,6 +506,7 @@ impl DeckApp {
                 ui.add_space(8.0);
                 ui.selectable_value(&mut self.settings_section, 0, "Library");
                 ui.selectable_value(&mut self.settings_section, 1, "Appearance");
+                ui.selectable_value(&mut self.settings_section, 2, "Lyrics");
             });
         egui::CentralPanel::default().frame(egui::Frame::none().fill(colors.background).inner_margin(egui::Margin::same(20.0)))
             .show(ctx, |ui| {
@@ -322,7 +525,7 @@ impl DeckApp {
                             if let Some(folder) = self.library_folder.clone() { self.scan_folder(&folder); }
                         }
                     });
-                } else {
+                } else if self.settings_section == 1 {
                     ui.heading("Appearance");
                     ui.add_space(16.0);
                     let mut changed = false;
@@ -333,6 +536,32 @@ impl DeckApp {
                     egui::ComboBox::from_label("Accent color").selected_text(["Orange", "Blue", "Green", "Purple"][self.accent_color.min(3) as usize]).show_ui(ui, |ui| {
                         for (i, label) in ["Orange", "Blue", "Green", "Purple"].iter().enumerate() { changed |= ui.selectable_value(&mut self.accent_color, i as u8, *label).changed(); }
                     });
+                    if changed { self.save_current_state(); ctx.request_repaint_of(egui::ViewportId::ROOT); }
+                } else {
+                    ui.heading("Lyrics");
+                    ui.add_space(16.0);
+                    let mut changed = false;
+
+                    ui.label(egui::RichText::new("Font size").strong());
+                    changed |= ui.add(egui::Slider::new(&mut self.lyrics_size, 12.0..=36.0).text("px")).changed();
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new("Line spacing").strong());
+                    changed |= ui.add(egui::Slider::new(&mut self.lyrics_spacing, 4.0..=32.0).text("px")).changed();
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new("Context lines (before / after)").strong());
+                    changed |= ui.add(egui::Slider::new(&mut self.lyrics_context, 1..=4).text("lines")).changed();
+                    ui.label(egui::RichText::new(format!("Displays {} lines total around current line", (self.lyrics_context as usize * 2) + 1)).size(10.0).color(colors.muted));
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new("Text alignment").strong());
+                    egui::ComboBox::from_label("Alignment").selected_text(["Center", "Left", "Right"][self.lyrics_align.min(2) as usize]).show_ui(ui, |ui| {
+                        for (i, label) in ["Center", "Left", "Right"].iter().enumerate() {
+                            changed |= ui.selectable_value(&mut self.lyrics_align, i as u8, *label).changed();
+                        }
+                    });
+
                     if changed { self.save_current_state(); ctx.request_repaint_of(egui::ViewportId::ROOT); }
                 }
             });
@@ -351,7 +580,7 @@ impl DeckApp {
         });
     }
 
-    fn play_track_at_index(&mut self, idx: usize, _ctx: &egui::Context, is_user_direct_pick: bool) {
+    fn play_track_at_index(&mut self, idx: usize, is_user_direct_pick: bool) {
         if idx >= self.playlist.len() { return; }
         self.selected_idx = Some(idx);
         self.highlighted_idx = Some(idx);
@@ -369,6 +598,9 @@ impl DeckApp {
             audio.send(AudioCommand::SetVolume(self.volume));
         }
         self.load_artwork(path);
+        self.lyrics_scroll_offset = 0.0;
+        self.lyrics_user_offset = 0.0;
+        self.lyrics_user_scroll_timer = 0.0;
         if is_user_direct_pick { self.rebuild_shuffle_order(Some(idx)); }
         self.save_current_state();
     }
@@ -385,12 +617,12 @@ impl DeckApp {
         Some(index)
     }
 
-    fn next_track(&mut self, ctx: &egui::Context) {
-        if let Some(index) = self.advance_order(true) { self.play_track_at_index(index, ctx, false); }
+    fn next_track(&mut self) {
+        if let Some(index) = self.advance_order(true) { self.play_track_at_index(index, false); }
     }
 
-    fn prev_track(&mut self, ctx: &egui::Context) {
-        if let Some(index) = self.advance_order(false) { self.play_track_at_index(index, ctx, false); }
+    fn prev_track(&mut self) {
+        if let Some(index) = self.advance_order(false) { self.play_track_at_index(index, false); }
     }
 
     fn play_next(&mut self, index: usize) {
@@ -542,6 +774,50 @@ impl eframe::App for DeckApp {
         if !self.smtc_inited {
             self.smtc_inited = true;
             self.init_media_controls(frame);
+
+            #[cfg(target_os = "windows")]
+            {
+                use raw_window_handle::HasWindowHandle;
+                if let Ok(handle) = frame.window_handle() {
+                    if let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() {
+                        let raw_hwnd = win32.hwnd.get() as usize;
+                        let (req_tx, req_rx) = crossbeam_channel::bounded::<crossbeam_channel::Sender<bool>>(1);
+                        self.bg_tx = Some(req_tx.clone());
+                        let ctx_clone = ctx.clone();
+                        std::thread::Builder::new()
+                            .name("deck-window-restorer".into())
+                            .spawn(move || {
+                                while let Ok(reply_tx) = req_rx.recv() {
+                                    unsafe {
+                                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                                            IsIconic, ShowWindowAsync, SW_MINIMIZE, SW_RESTORE
+                                        };
+                                        let hwnd = raw_hwnd as *mut std::ffi::c_void;
+                                        if IsIconic(hwnd) != 0 {
+                                            ShowWindowAsync(hwnd, SW_RESTORE);
+                                            std::thread::sleep(std::time::Duration::from_millis(15));
+                                            ShowWindowAsync(hwnd, SW_MINIMIZE);
+                                        }
+                                    }
+                                    ctx_clone.request_repaint();
+                                    let _ = reply_tx.send(true);
+                                }
+                            })
+                            .ok();
+
+                        if let Some(audio) = &self.audio {
+                            let wake_req_tx = req_tx;
+                            let wake_ctx = ctx.clone();
+                            audio.set_wake_callback(move || {
+                                wake_ctx.request_repaint();
+                                let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+                                let _ = wake_req_tx.send(reply_tx);
+                                let _ = reply_rx.recv_timeout(std::time::Duration::from_millis(100));
+                            });
+                        }
+                    }
+                }
+            }
         }
         self.update_ui(ctx);
     }
@@ -639,10 +915,10 @@ impl DeckApp {
                     }
                 }
                 souvlaki::MediaControlEvent::Next => {
-                    self.next_track(ctx);
+                    self.next_track();
                 }
                 souvlaki::MediaControlEvent::Previous => {
-                    self.prev_track(ctx);
+                    self.prev_track();
                 }
                 souvlaki::MediaControlEvent::Stop => {
                     if self.is_playing {
@@ -666,10 +942,10 @@ impl DeckApp {
                 }
             }
             if (GetAsyncKeyState(VK_MEDIA_NEXT_TRACK as i32) as u16 & 0x0001) != 0 {
-                self.next_track(ctx);
+                self.next_track();
             }
             if (GetAsyncKeyState(VK_MEDIA_PREV_TRACK as i32) as u16 & 0x0001) != 0 {
-                self.prev_track(ctx);
+                self.prev_track();
             }
         }
 
@@ -711,7 +987,7 @@ impl DeckApp {
             }
         }
         if track_finished {
-            self.next_track(ctx);
+            self.next_track();
         }
 
         ctx.input(|i| {
@@ -723,502 +999,17 @@ impl DeckApp {
             }
         });
 
-        // Keep playback and resize feedback smooth; pause uses a slower idle refresh.
-        if self.is_playing || self.is_scrubbing || (self.hover_transition > 0.001 && self.hover_transition < 0.999) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // 60 FPS hover lerp
+        // Power & GPU Saver: Throttle repaints when window is unfocused / in background.
+        // Smooth 60 FPS is only needed when DECK is focused and actively animating.
+        // In the background or minimized, 10 FPS (100ms) or 4 FPS (250ms) keeps CPU/GPU load at ~0%
+        // while guaranteeing track changes and status updates process immediately.
+        let is_window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if is_window_focused && (self.is_playing || self.is_scrubbing || (self.hover_transition > 0.001 && self.hover_transition < 0.999) || self.lyrics_open) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // 60 FPS smooth animation lerp when focused
+        } else if self.is_playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100)); // 10 FPS background playback: near 0% GPU/CPU
         } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250)); // 4 FPS idle playback: near 0% CPU!
-        }
-
-        // ================= BOTTOM DOCKED SINGLE-LINE PLAYER BAR =================
-        let control_room = ((ctx.screen_rect().width() - 340.0) / 280.0).clamp(0.0, 1.0);
-        let transport_height = 54.0;
-        let mut queue_anchor = Rect::NOTHING;
-        egui::TopBottomPanel::bottom("transport_bar")
-            .resizable(false)
-            .exact_height(transport_height)
-            .show_separator_line(false)
-            .frame(egui::Frame::none().fill(colors.background))
-            .show(ctx, |ui| {
-                let panel_rect = ui.available_rect_before_wrap();
-                let mouse_pos = ctx.input(|i| i.pointer.hover_pos());
-                let is_panel_hovered = mouse_pos.map_or(false, |p| panel_rect.contains(p));
-
-                // Smooth hover transition animation (0.0 to 1.0)
-                let target_t = if is_panel_hovered { 1.0 } else { 0.0 };
-                let dt = ctx.input(|i| i.stable_dt).min(0.1);
-                self.hover_transition += (target_t - self.hover_transition) * (dt * 15.0).min(1.0);
-
-                // ---------------- YOUTUBE-STYLE INTERACTIVE SEEKBAR ON TOP ----------------
-                let bar_thickness = 3.0 + (3.0 * self.hover_transition);
-                let hit_height = 16.0;
-                let seek_y = panel_rect.min.y + bar_thickness * 0.5;
-
-                let seek_hit_rect = Rect::from_min_size(
-                    panel_rect.min,
-                    Vec2::new(panel_rect.width(), hit_height),
-                );
-
-                let seek_visual_rect = Rect::from_center_size(
-                    pos2(panel_rect.center().x, seek_y),
-                    Vec2::new(panel_rect.width(), bar_thickness),
-                );
-
-                let seek_response = ui.interact(seek_hit_rect, ui.id().with("seekbar"), egui::Sense::click_and_drag());
-
-                // Track background: Solid matching color, no white gap
-                ui.painter().rect_filled(seek_visual_rect, Rounding::ZERO, Color32::from_rgb(0xD8, 0xD0, 0xC4));
-
-                // Elapsed fill: Solid accent orange
-                let filled_width = (panel_rect.width() * self.progress.clamp(0.0, 1.0)).max(0.0);
-                let progress_rect = Rect::from_min_size(
-                    seek_visual_rect.min,
-                    Vec2::new(filled_width, bar_thickness),
-                );
-                ui.painter().rect_filled(progress_rect, Rounding::ZERO, colors.accent);
-
-                // YouTube-style playhead circle: solid accent orange without white outline
-                let head_radius = (5.5 * self.hover_transition).max(0.0);
-                if head_radius > 0.5 {
-                    let playhead_pos = pos2((seek_visual_rect.min.x + filled_width).clamp(panel_rect.min.x + head_radius, panel_rect.max.x - head_radius), seek_visual_rect.center().y);
-                    // Let the thumb overlap the artwork edge without adding a blank
-                    // strip above the track or clipping the upper half of the circle.
-                    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("seek_thumb")))
-                        .with_clip_rect(ctx.screen_rect()).circle_filled(
-                        playhead_pos,
-                        head_radius,
-                        colors.accent,
-                    );
-                }
-
-                // Dragging previews locally. Commit exactly one seek at release, and
-                // reject old telemetry until the playback worker acknowledges its revision.
-                if seek_response.drag_started() { self.is_scrubbing = true; }
-                if seek_response.clicked() || seek_response.dragged() || seek_response.drag_stopped() {
-                    if let Some(pt) = seek_response.interact_pointer_pos() {
-                        self.progress = ((pt.x - seek_visual_rect.min.x) / seek_visual_rect.width()).clamp(0.0, 1.0);
-                    }
-                }
-                if seek_response.drag_stopped() || seek_response.clicked() {
-                    self.is_scrubbing = false;
-                    if let Some(audio) = &self.audio {
-                        self.audio_revision = audio.send(AudioCommand::Seek(self.progress));
-                    }
-                    self.save_current_state();
-                }
-
-                // Strictly center all controls vertically between seekbar and bottom edge
-                let center_y = panel_rect.min.y + 32.0;
-                let btn_size = 22.0;
-
-                // --- 1. LEFT ZONE: [🔀] [⚙] (uniform 12px gap, aligned to exact center_y) ---
-                let left_margin = 8.0 + 6.0 * control_room;
-                let left_gap = 8.0 + 4.0 * control_room;
-
-                let shuf_rect = Rect::from_center_size(pos2(panel_rect.min.x + left_margin + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
-                let shuf_resp = ui.allocate_rect(shuf_rect, egui::Sense::click());
-                let shuf_color = if self.shuffle_enabled { colors.accent } else if shuf_resp.hovered() { colors.text } else { colors.muted };
-                
-                // Pixel-perfect vector shuffle icon
-                {
-                    let p = ui.painter();
-                    let stroke = Stroke::new(1.6, shuf_color);
-                    let c = shuf_rect.center();
-                    // Top crossover arrow: (-6, -4) -> (-1, -4) -> (2, 4) -> (6, 4)
-                    p.line_segment([pos2(c.x - 6.0, c.y - 3.5), pos2(c.x - 2.0, c.y - 3.5)], stroke);
-                    p.line_segment([pos2(c.x - 2.0, c.y - 3.5), pos2(c.x + 2.0, c.y + 3.5)], stroke);
-                    p.line_segment([pos2(c.x + 2.0, c.y + 3.5), pos2(c.x + 6.0, c.y + 3.5)], stroke);
-                    // Arrowhead bottom:
-                    p.line_segment([pos2(c.x + 3.5, c.y + 1.0), pos2(c.x + 6.0, c.y + 3.5)], stroke);
-                    p.line_segment([pos2(c.x + 3.5, c.y + 6.0), pos2(c.x + 6.0, c.y + 3.5)], stroke);
-
-                    // Bottom crossover arrow: (-6, 4) -> (-1, 4) -> (2, -4) -> (6, -4)
-                    p.line_segment([pos2(c.x - 6.0, c.y + 3.5), pos2(c.x - 2.0, c.y + 3.5)], stroke);
-                    p.line_segment([pos2(c.x - 2.0, c.y + 3.5), pos2(c.x + 2.0, c.y - 3.5)], stroke);
-                    p.line_segment([pos2(c.x + 2.0, c.y - 3.5), pos2(c.x + 6.0, c.y - 3.5)], stroke);
-                    // Arrowhead top:
-                    p.line_segment([pos2(c.x + 3.5, c.y - 6.0), pos2(c.x + 6.0, c.y - 3.5)], stroke);
-                    p.line_segment([pos2(c.x + 3.5, c.y - 1.0), pos2(c.x + 6.0, c.y - 3.5)], stroke);
-                }
-
-                if shuf_resp.clicked() {
-                    self.shuffle_enabled = !self.shuffle_enabled;
-                    self.rebuild_shuffle_order(self.selected_idx);
-                    self.save_current_state();
-                }
-
-                let set_rect = Rect::from_center_size(pos2(shuf_rect.max.x + left_gap + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
-                let set_resp = ui.allocate_rect(set_rect, egui::Sense::click());
-                let set_color = if set_resp.hovered() { colors.text } else { colors.muted };
-                
-                for offset in [-5.0, 0.0, 5.0] {
-                    let c = set_rect.center();
-                    ui.painter().line_segment([pos2(c.x - 5.0, c.y + offset), pos2(c.x + 6.0, c.y + offset)], Stroke::new(1.5, set_color));
-                    ui.painter().circle_filled(pos2(c.x - 8.0, c.y + offset), 1.0, set_color);
-                }
-                queue_anchor = set_rect;
-                if set_resp.clicked() {
-                    self.queue_open = !self.queue_open;
-                    self.queue_drag = None;
-                    if self.queue_open { self.speed_open = false; self.reverb_open = false; }
-                }
-                set_resp.on_hover_text("Queue: view the current mix");
-
-                // --- 2. EXACT CENTER ZONE: [⏮] [▶/⏸] [⏭] (uniform 14px gap, aligned to exact center_y) ---
-                let center_x = panel_rect.center().x - 20.0 * (1.0 - control_room);
-                let center_gap = 8.0 + 6.0 * control_room;
-
-                let play_rect = Rect::from_center_size(pos2(center_x, center_y), Vec2::splat(btn_size));
-                let prev_rect = Rect::from_center_size(pos2(play_rect.min.x - center_gap - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
-                let next_rect = Rect::from_center_size(pos2(play_rect.max.x + center_gap + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
-
-                // Previous
-                let prev_resp = ui.allocate_rect(prev_rect, egui::Sense::click());
-                let prev_color = if prev_resp.is_pointer_button_down_on() { colors.accent } else if prev_resp.hovered() { colors.text } else { colors.text };
-                {
-                    let p = ui.painter();
-                    let c = prev_rect.center();
-                    // Left bar:
-                    p.rect_filled(Rect::from_center_size(pos2(c.x - 5.0, c.y), Vec2::new(2.0, 11.0)), Rounding::ZERO, prev_color);
-                    // Left triangle:
-                    let p1 = pos2(c.x - 3.5, c.y);
-                    let p2 = pos2(c.x + 5.0, c.y - 5.5);
-                    let p3 = pos2(c.x + 5.0, c.y + 5.5);
-                    p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], prev_color, Stroke::NONE));
-                }
-                if prev_resp.clicked() {
-                    self.prev_track(ctx);
-                }
-
-                // Play / Pause
-                let play_resp = ui.allocate_rect(play_rect, egui::Sense::click());
-                let play_color = if play_resp.is_pointer_button_down_on() { colors.accent } else if play_resp.hovered() { colors.text } else { colors.text };
-                {
-                    let p = ui.painter();
-                    let c = play_rect.center();
-                    if self.is_playing {
-                        // Pause: two solid bars
-                        p.rect_filled(Rect::from_center_size(pos2(c.x - 3.0, c.y), Vec2::new(3.0, 12.0)), Rounding::ZERO, play_color);
-                        p.rect_filled(Rect::from_center_size(pos2(c.x + 3.0, c.y), Vec2::new(3.0, 12.0)), Rounding::ZERO, play_color);
-                    } else {
-                        // Play: right-pointing triangle centered mathematically
-                        let p1 = pos2(c.x - 4.5, c.y - 6.5);
-                        let p2 = pos2(c.x - 4.5, c.y + 6.5);
-                        let p3 = pos2(c.x + 5.5, c.y);
-                        p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], play_color, Stroke::NONE));
-                    }
-                }
-                if play_resp.clicked() {
-                    if let Some(audio) = &self.audio {
-                        audio.send(AudioCommand::Toggle);
-                    }
-                }
-
-                // Next
-                let next_resp = ui.allocate_rect(next_rect, egui::Sense::click());
-                let next_color = if next_resp.is_pointer_button_down_on() { colors.accent } else if next_resp.hovered() { colors.text } else { colors.text };
-                {
-                    let p = ui.painter();
-                    let c = next_rect.center();
-                    // Right-pointing triangle:
-                    let p1 = pos2(c.x - 5.0, c.y - 5.5);
-                    let p2 = pos2(c.x - 5.0, c.y + 5.5);
-                    let p3 = pos2(c.x + 3.5, c.y);
-                    p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], next_color, Stroke::NONE));
-                    // Right bar:
-                    p.rect_filled(Rect::from_center_size(pos2(c.x + 5.0, c.y), Vec2::new(2.0, 11.0)), Rounding::ZERO, next_color);
-                }
-                if next_resp.clicked() {
-                    self.next_track(ctx);
-                }
-
-                // --- 3. RIGHT ZONE: [Volume Slider] [Speed (1x)] [Reverb (~)] (uniform 12px gap, aligned to exact center_y) ---
-                let right_margin = 8.0 + 6.0 * control_room;
-                let right_gap = 8.0 + 6.0 * control_room;
-
-                // Reverb Icon (Minimalist "~" wave icon)
-                let rev_rect = Rect::from_center_size(pos2(panel_rect.max.x - right_margin - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
-                let rev_resp = ui.allocate_rect(rev_rect, egui::Sense::click());
-                let rev_color = if self.reverb_open || self.reverb_amount > 0.01 { colors.accent } else if rev_resp.hovered() { colors.text } else { colors.muted };
-                ui.painter().text(rev_rect.center(), egui::Align2::CENTER_CENTER, "~", egui::FontId::monospace(15.0), rev_color);
-                if rev_resp.clicked() {
-                    self.reverb_open = !self.reverb_open;
-                    if self.reverb_open {
-                        self.queue_open = false;
-                        self.speed_open = false;
-                    }
-                }
-
-                // Speed Icon (Dynamic speed text based on active playback speed)
-                let spd_rect = Rect::from_center_size(pos2(rev_rect.min.x - right_gap - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
-                let spd_resp = ui.allocate_rect(spd_rect, egui::Sense::click());
-                let spd_color = if self.speed_open || (self.speed - 1.0).abs() > 0.01 { colors.accent } else if spd_resp.hovered() { colors.text } else { colors.muted };
-                let spd_text = if (self.speed - 1.0).abs() < 0.01 {
-                    "1x".to_string()
-                } else if ((self.speed * 10.0).round() - (self.speed * 10.0)).abs() < 0.01 {
-                    format!("{:.1}x", self.speed)
-                } else {
-                    format!("{:.2}x", self.speed)
-                };
-                ui.painter().text(spd_rect.center(), egui::Align2::CENTER_CENTER, spd_text, egui::FontId::monospace(10.5), spd_color);
-                if spd_resp.clicked() {
-                    self.speed_open = !self.speed_open;
-                    if self.speed_open {
-                        self.queue_open = false;
-                        self.reverb_open = false;
-                    }
-                }
-
-                // Volume Slider (Matching playhead, perfectly centered on center_y)
-                let slider_width = 42.0 + 33.0 * control_room;
-                let slider_rect = Rect::from_center_size(pos2(spd_rect.min.x - (right_gap + 4.0) - (slider_width * 0.5), center_y), Vec2::new(slider_width, 14.0));
-                let slider_resp = ui.allocate_rect(slider_rect, egui::Sense::click_and_drag());
-
-                if slider_resp.clicked() || slider_resp.dragged() {
-                    if let Some(pt) = slider_resp.interact_pointer_pos() {
-                        let new_vol = ((pt.x - slider_rect.min.x) / slider_rect.width()).clamp(0.0, 1.0);
-                        self.volume = new_vol;
-                        if let Some(audio) = &self.audio {
-                            audio.send(AudioCommand::SetVolume(self.volume));
-                        }
-                        self.save_current_state();
-                    }
-                }
-                // Scroll wheel volume adjustment
-                if slider_resp.hovered() {
-                    let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
-                    if scroll_delta.abs() > 0.01 {
-                        self.volume = (self.volume + scroll_delta.signum() * 0.03).clamp(0.0, 1.0);
-                        if let Some(audio) = &self.audio {
-                            audio.send(AudioCommand::SetVolume(self.volume));
-                        }
-                        self.save_current_state();
-                    }
-                }
-
-                let vol_bar_h = if slider_resp.hovered() || slider_resp.dragged() { 4.0 } else { 3.0 };
-                let vol_bar_rect = Rect::from_center_size(slider_rect.center(), Vec2::new(slider_rect.width(), vol_bar_h));
-                ui.painter().rect_filled(vol_bar_rect, Rounding::same(1.5), Color32::from_rgb(0xD8, 0xD0, 0xC4));
-
-                let fill_w = slider_rect.width() * self.volume.clamp(0.0, 1.0);
-                let fill_rect = Rect::from_min_size(vol_bar_rect.min, Vec2::new(fill_w, vol_bar_h));
-                ui.painter().rect_filled(fill_rect, Rounding::same(1.5), colors.accent);
-
-                let head_rad = if slider_resp.hovered() || slider_resp.dragged() { 5.0 } else { 4.0 };
-                ui.painter().circle_filled(pos2(vol_bar_rect.min.x + fill_w, center_y), head_rad, colors.accent);
-
-                // --- POPUP WINDOW: REVERB (Shifted left to guarantee it never cuts off window border) ---
-                if self.reverb_open {
-                    let popup_w = 120.0;
-                    let max_popup_x = (panel_rect.max.x - popup_w - 12.0).min(rev_rect.center().x - (popup_w * 0.5));
-                    let popup_pos = pos2(max_popup_x, panel_rect.min.y - 75.0);
-                    let popup = egui::Area::new(egui::Id::new("reverb_popup"))
-                        .fixed_pos(popup_pos)
-                        .order(egui::Order::Foreground)
-                        .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style())
-                                .fill(colors.card)
-                                .stroke(Stroke::new(1.0, colors.border))
-                                .rounding(Rounding::same(4.0))
-                                .inner_margin(egui::Margin::same(8.0))
-                                .show(ui, |ui| {
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(egui::RichText::new("REVERB").size(9.0).strong().color(colors.muted));
-                                        ui.add_space(2.0);
-
-                                        let (rev_s_rect, rev_s_resp) = ui.allocate_exact_size(Vec2::new(100.0, 14.0), egui::Sense::click_and_drag());
-                                        if rev_s_resp.clicked() || rev_s_resp.dragged() {
-                                            if let Some(pt) = rev_s_resp.interact_pointer_pos() {
-                                                self.reverb_amount = ((pt.x - rev_s_rect.min.x) / rev_s_rect.width()).clamp(0.0, 1.0);
-                                                if let Some(audio) = &self.audio {
-                                                    audio.send(AudioCommand::SetReverb(self.reverb_amount));
-                                                }
-                                                self.save_current_state();
-                                            }
-                                        }
-                                        if rev_s_resp.hovered() {
-                                            let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
-                                            if scroll_delta.abs() > 0.01 {
-                                                self.reverb_amount = (self.reverb_amount + scroll_delta.signum() * 0.03).clamp(0.0, 1.0);
-                                                if let Some(audio) = &self.audio {
-                                                    audio.send(AudioCommand::SetReverb(self.reverb_amount));
-                                                }
-                                                self.save_current_state();
-                                            }
-                                        }
-                                        let r_bar = Rect::from_center_size(rev_s_rect.center(), Vec2::new(rev_s_rect.width(), 3.0));
-                                        ui.painter().rect_filled(r_bar, Rounding::same(1.5), Color32::from_rgb(0xD8, 0xD0, 0xC4));
-                                        let r_fill = Rect::from_min_size(r_bar.min, Vec2::new(rev_s_rect.width() * self.reverb_amount, 3.0));
-                                        ui.painter().rect_filled(r_fill, Rounding::same(1.5), colors.accent);
-                                        ui.painter().circle_filled(pos2(r_bar.min.x + (rev_s_rect.width() * self.reverb_amount), r_bar.center().y), 4.5, colors.accent);
-
-                                        ui.add_space(2.0);
-                                        ui.label(egui::RichText::new(format!("{:.0}%", self.reverb_amount * 100.0)).size(10.0).color(colors.text));
-                                    });
-                                });
-                        });
-                    if dismiss_popup(ctx, popup.response.rect, rev_rect) { self.reverb_open = false; }
-                }
-
-                // --- POPUP WINDOW: SPEED (Shifted left to guarantee it never cuts off window border) ---
-                if self.speed_open {
-                    let popup_w = 120.0;
-                    let max_popup_x = (panel_rect.max.x - popup_w - 12.0).min(spd_rect.center().x - (popup_w * 0.5));
-                    let popup_pos = pos2(max_popup_x, panel_rect.min.y - 75.0);
-                    let popup = egui::Area::new(egui::Id::new("speed_popup"))
-                        .fixed_pos(popup_pos)
-                        .order(egui::Order::Foreground)
-                        .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style())
-                                .fill(colors.card)
-                                .stroke(Stroke::new(1.0, colors.border))
-                                .rounding(Rounding::same(4.0))
-                                .inner_margin(egui::Margin::same(8.0))
-                                .show(ui, |ui| {
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(egui::RichText::new("SPEED").size(9.0).strong().color(colors.muted));
-                                        ui.add_space(2.0);
-
-                                        let (spd_s_rect, spd_s_resp) = ui.allocate_exact_size(Vec2::new(100.0, 14.0), egui::Sense::click_and_drag());
-                                        if spd_s_resp.clicked() || spd_s_resp.dragged() {
-                                            if let Some(pt) = spd_s_resp.interact_pointer_pos() {
-                                                let frac = ((pt.x - spd_s_rect.min.x) / spd_s_rect.width()).clamp(0.0, 1.0);
-                                                self.speed = 0.5 + (frac * 1.0);
-                                                if let Some(audio) = &self.audio {
-                                                    audio.send(AudioCommand::SetSpeed(self.speed));
-                                                }
-                                                self.save_current_state();
-                                            }
-                                        }
-                                        if spd_s_resp.hovered() {
-                                            let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
-                                            if scroll_delta.abs() > 0.01 {
-                                                self.speed = (self.speed + scroll_delta.signum() * 0.05).clamp(0.5, 1.5);
-                                                if let Some(audio) = &self.audio {
-                                                    audio.send(AudioCommand::SetSpeed(self.speed));
-                                                }
-                                                self.save_current_state();
-                                            }
-                                        }
-                                        let s_frac = ((self.speed - 0.5) / 1.0).clamp(0.0, 1.0);
-                                        let s_bar = Rect::from_center_size(spd_s_rect.center(), Vec2::new(spd_s_rect.width(), 3.0));
-                                        ui.painter().rect_filled(s_bar, Rounding::same(1.5), Color32::from_rgb(0xD8, 0xD0, 0xC4));
-                                        let s_fill = Rect::from_min_size(s_bar.min, Vec2::new(spd_s_rect.width() * s_frac, 3.0));
-                                        ui.painter().rect_filled(s_fill, Rounding::same(1.5), colors.accent);
-                                        ui.painter().circle_filled(pos2(s_bar.min.x + (spd_s_rect.width() * s_frac), s_bar.center().y), 4.5, colors.accent);
-
-                                        ui.add_space(2.0);
-                                        ui.label(egui::RichText::new(format!("{:.2}x", self.speed)).size(10.0).color(colors.text));
-                                    });
-                                });
-                        });
-                    if dismiss_popup(ctx, popup.response.rect, spd_rect) { self.speed_open = false; }
-                }
-            });
-
-        if let Some(message) = self.audio_error.clone() {
-            egui::Window::new("Audio playback error").collapsible(false).show(ctx, |ui| {
-                ui.label(message);
-                if ui.button("Dismiss").clicked() { self.audio_error = None; }
-            });
-        }
-
-        if self.queue_open {
-            let rows: Vec<_> = self.shuffle_order.iter().enumerate().filter_map(|(position, &index)|
-                self.playlist.get(index).map(|t| (position, index, t.title.clone(), t.artist.clone()))).collect();
-            let mut jump = None;
-            let mut promote = None;
-            let mut insertion = None;
-            let mut queue_context_rect = Rect::NOTHING;
-            let popup_width = 320.0f32.min(ctx.screen_rect().width() - 32.0);
-            let list_height = (rows.len() as f32 * 30.0).max(28.0).min((ctx.screen_rect().height() * 0.5).min(320.0));
-            let popup = egui::Area::new(egui::Id::new("queue_popup"))
-                .movable(false)
-                .order(egui::Order::Foreground)
-                .fixed_pos(pos2(8.0, ctx.screen_rect().max.y - transport_height - 8.0 - list_height - 36.0)).constrain(true)
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).fill(colors.card)
-                        .stroke(Stroke::new(1.0, colors.border)).rounding(Rounding::same(4.0))
-                        .inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
-                            ui.set_width(popup_width);
-                            ui.label(egui::RichText::new("QUEUE").size(9.0).strong().color(colors.muted));
-                            if rows.is_empty() { ui.label("Queue is empty"); }
-                            egui::ScrollArea::vertical().id_source("queue_tracks")
-                                .drag_to_scroll(false)
-                                .max_height(list_height).min_scrolled_height(list_height)
-                                .auto_shrink([false, false]).show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 2.0;
-                                    for (position, index, title, artist) in rows {
-                                        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::hover());
-                                        let handle = Rect::from_min_size(row.min, Vec2::new(22.0, row.height()));
-                                        let response = ui.interact(handle, ui.id().with(("queue_drag", index)), egui::Sense::drag());
-                                        if response.drag_started() { self.queue_drag = Some(index); }
-                                        if response.hovered() { ctx.set_cursor_icon(egui::CursorIcon::Grab); }
-                                        let active = self.queue_drag == Some(index);
-                                        if active { ui.painter().rect_stroke(row.shrink(1.0), Rounding::same(2.0), Stroke::new(1.0, colors.accent)); }
-                                        let handle_color = if active || response.hovered() { colors.accent } else { colors.muted };
-                                        for x in [-2.5, 2.5] { for y in [-5.0, 0.0, 5.0] {
-                                            ui.painter().circle_filled(handle.center() + Vec2::new(x, y), 1.2, handle_color);
-                                        }}
-                                        let text_rect = Rect::from_min_max(pos2(handle.max.x + 4.0, row.min.y), row.max);
-                                        let marker = if self.selected_idx == Some(index) { ">" } else if self.user_queue.contains(&index) { "+" } else { "" };
-                                        let label = ui.allocate_ui_at_rect(text_rect, |ui| {
-                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                                ui.add(egui::Label::new(format!("{} {}. {} - {}", marker, position + 1, title, artist)).truncate(true).sense(egui::Sense::click()))
-                                            }).inner
-                                        }).inner;
-                                        if label.double_clicked() { jump = Some((position, index)); }
-                                        if let Some(menu) = label.context_menu(|ui| {
-                                            if ui.button("Play next").clicked() { promote = Some(index); ui.close_menu(); }
-                                        }) { queue_context_rect = menu.response.rect; }
-                                        if self.queue_drag.is_some() {
-                                            if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
-                                                if row.contains(pointer) && ui.clip_rect().contains(pointer) {
-                                                    let after = pointer.y > row.center().y;
-                                                    insertion = Some(position + usize::from(after));
-                                                    let y = if after { row.max.y } else { row.min.y };
-                                                    ui.painter().line_segment([pos2(row.min.x, y), pos2(row.max.x, y)], Stroke::new(2.0, colors.accent));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if self.queue_drag.is_some() {
-                                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                                        ctx.request_repaint_after(std::time::Duration::from_millis(16));
-                                        if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
-                                            let viewport = ui.clip_rect();
-                                            if viewport.contains(pointer) {
-                                                let delta = if pointer.y < viewport.top() + 24.0 { 6.0 } else if pointer.y > viewport.bottom() - 24.0 { -6.0 } else { 0.0 };
-                                                ui.scroll_with_delta(Vec2::new(0.0, delta));
-                                            }
-                                        }
-                                    }
-                                });
-                        });
-                });
-            if ctx.input(|i| i.pointer.any_released()) {
-                if let (Some(index), Some(position)) = (self.queue_drag.take(), insertion) { self.move_queue_track(index, position); }
-            }
-            if dismiss_popup(ctx, popup.response.rect.union(queue_context_rect), queue_anchor) {
-                self.queue_open = false;
-                self.queue_drag = None;
-            }
-            if let Some(index) = promote { self.play_next(index); }
-            if let Some((position, index)) = jump {
-                self.shuffle_pos = position;
-                self.play_track_at_index(index, ctx, false);
-            }
-        } else { self.queue_drag = None; }
-
-        if self.settings_open {
-            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("deck_preferences"),
-                egui::ViewportBuilder::default().with_title("DECK Preferences")
-                    .with_inner_size([560.0, 360.0]).with_min_inner_size([440.0, 280.0])
-                    .with_resizable(true), |ctx, class| {
-                    if class == egui::ViewportClass::Embedded { return; }
-                    self.preferences_ui(ctx);
-                    if ctx.input(|i| i.viewport().close_requested()) { self.settings_open = false; }
-                });
+            ctx.request_repaint_after(std::time::Duration::from_millis(250)); // 4 FPS idle pause
         }
 
         // ================= CENTRAL PANEL: RESPONSIVE LANDSCAPE / PORTRAIT LAYOUT =================
@@ -1340,11 +1131,11 @@ impl DeckApp {
                         });
                     } else {
                         let q = self.search_query.to_lowercase();
-                        let filtered: Vec<(usize, String, String, String)> = self.playlist
+                        let filtered: Vec<(usize, String, String)> = self.playlist
                             .iter()
                             .enumerate()
                             .filter(|(_, t)| q.is_empty() || t.title.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q))
-                            .map(|(i, t)| (i, t.title.clone(), t.artist.clone(), t.duration_str.clone()))
+                            .map(|(i, t)| (i, t.title.clone(), t.artist.clone()))
                             .collect();
 
                         let mut chosen_idx = None;
@@ -1356,7 +1147,7 @@ impl DeckApp {
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
                                 let row_height = 20.0; // Strictly uniform 20px per track
-                                for (idx, title, artist, duration_str) in filtered {
+                                for (idx, title, artist) in filtered {
                                     let is_sel = self.selected_idx == Some(idx) || self.highlighted_idx == Some(idx);
                                     let text_pad = 6.0;
 
@@ -1390,7 +1181,7 @@ impl DeckApp {
                                         ui.painter().rect_filled(row_rect, Rounding::same(2.0), colors.card);
                                         ui.painter().rect_stroke(row_rect, Rounding::same(2.0), Stroke::new(1.0, colors.border));
                                     } else if response.hovered() {
-                                        ui.painter().rect_filled(row_rect, Rounding::same(2.0), Color32::from_rgb(0xEB, 0xE5, 0xDC));
+                                        ui.painter().rect_filled(row_rect, Rounding::same(2.0), colors.hover);
                                     }
 
                                     let font_id = egui::FontId::monospace(10.0);
@@ -1398,17 +1189,8 @@ impl DeckApp {
                                     let title_color = colors.text;
                                     let artist_color = if is_sel { colors.accent } else { colors.muted };
 
-                                    // Duration (Right) - Reserve 40px
-                                    ui.painter().text(
-                                        pos2(row_rect.max.x - text_pad, row_rect.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        &duration_str,
-                                        egui::FontId::monospace(9.5),
-                                        colors.muted,
-                                    );
-
-                                    // Single-line text truncation to maintain strictly uniform single rows
-                                    let available_text_width = (row_rect.width() - (text_pad * 2.0) - 45.0).max(60.0);
+                                    // Single-line text truncation to maintain strictly uniform single rows (duration removed)
+                                    let available_text_width = (row_rect.width() - (text_pad * 2.0)).max(60.0);
                                     let title_allowed_width = available_text_width * 0.58;
                                     let artist_allowed_width = available_text_width * 0.40;
 
@@ -1427,7 +1209,7 @@ impl DeckApp {
                                         title_color,
                                     );
 
-                                    // Render Artist (single line with ellipsis)
+                                    // Render Artist (single line with ellipsis, right aligned)
                                     let mut display_artist = artist.clone();
                                     let mut artist_galley = ui.painter().layout_no_wrap(display_artist.clone(), artist_font_id.clone(), artist_color);
                                     if artist_galley.size().x > artist_allowed_width {
@@ -1437,7 +1219,7 @@ impl DeckApp {
                                         }
                                     }
                                     ui.painter().galley(
-                                        pos2(row_rect.max.x - text_pad - 45.0 - artist_galley.size().x, row_rect.center().y - (artist_galley.size().y * 0.5)),
+                                        pos2(row_rect.max.x - text_pad - artist_galley.size().x, row_rect.center().y - (artist_galley.size().y * 0.5)),
                                         artist_galley,
                                         artist_color,
                                     );
@@ -1445,7 +1227,7 @@ impl DeckApp {
                             });
 
                         if let Some(idx) = chosen_idx {
-                            self.play_track_at_index(idx, ctx, true);
+                            self.play_track_at_index(idx, true);
                         }
                     }
                 });
@@ -1467,7 +1249,249 @@ impl DeckApp {
                     );
                 }
 
-                if let Some(tex) = &self.cover_texture {
+                let has_lyrics = self.current_meta.as_ref().map_or(false, |m| m.lyrics.is_some());
+                if self.lyrics_open && has_lyrics {
+                    // Display lyrics in the style of YouTube Music:
+                    // 1. Cover artwork underneath (or dark card if no art)
+                    // 2. Lightened translucent overlay (gentle darkening)
+                    // 3. Proportional font and line sizing strictly tied to track cover dimensions
+                    // 4. Smooth continuous position lerp between lines
+                    // 5. Scroll interaction with timeout-based snap-back
+                    if let Some(tex) = &self.cover_texture {
+                        ui.painter().image(
+                            tex.id(),
+                            right_rect,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter().rect_filled(right_rect, Rounding::ZERO, colors.card);
+                    }
+                    // Reduced darkened overlay: gentle darkening so artwork stays visible
+                    ui.painter().rect_filled(right_rect, Rounding::ZERO, Color32::from_black_alpha(120));
+
+                    let lyrics_raw = self.current_meta.as_ref().and_then(|m| m.lyrics.as_ref()).cloned().unwrap_or_default();
+                    let parsed_lines = parse_lrc_lines(&lyrics_raw);
+                    let track_duration = self.current_meta.as_ref().map_or(0.0, |m| m.duration_secs);
+
+                    // Compute current active line based on playback duration and progress
+                    let cur_time = self.progress as f64 * track_duration;
+                    let has_timestamps = parsed_lines.iter().any(|l| l.time_secs.is_some());
+                    let mut active_line_idx = 0usize;
+                    if has_timestamps {
+                        for (i, line) in parsed_lines.iter().enumerate() {
+                            if let Some(t) = line.time_secs {
+                                if t <= cur_time {
+                                    active_line_idx = i;
+                                }
+                            }
+                        }
+                    }
+
+                    // --- MOUSE WHEEL SCROLLING & AUTO-SNAP TIMER ---
+                    let dt = ctx.input(|i| i.stable_dt).max(1.0 / 60.0).min(0.1);
+                    // Do not scroll lyrics if cursor is over the bottom transport footer (within 58px of screen bottom)
+                    // or if an active floating control popup is open.
+                    let pointer_pos = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()).or_else(|| i.pointer.interact_pos()));
+                    let is_in_footer_zone = pointer_pos.map_or(false, |p| p.y >= ctx.screen_rect().max.y - 58.0);
+                    let pointer_in_art = pointer_pos.map_or(false, |p| right_rect.contains(p)) && !is_in_footer_zone && self.active_floating_control.is_none();
+                    if pointer_in_art {
+                        let scroll_delta = ctx.input(|i| {
+                            if i.raw_scroll_delta.y.abs() > 0.01 {
+                                i.raw_scroll_delta.y
+                            } else if i.smooth_scroll_delta.y.abs() > 0.01 {
+                                i.smooth_scroll_delta.y
+                            } else {
+                                i.events.iter().find_map(|e| match e {
+                                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                                    _ => None,
+                                }).unwrap_or(0.0)
+                            }
+                        });
+                        if scroll_delta.abs() > 0.01 {
+                            // Precise line stepping: 1 standard mouse wheel tick (delta ~ 50-100) moves exactly 1 line
+                            let lines_to_move = if scroll_delta.abs() >= 10.0 {
+                                -scroll_delta.signum() * (scroll_delta.abs() / 50.0).round().max(1.0)
+                            } else {
+                                -scroll_delta * 0.01
+                            };
+                            self.lyrics_user_offset += lines_to_move;
+                            // Clamp manual scroll within bounds of track lines
+                            let max_offset = parsed_lines.len() as f32;
+                            if has_timestamps {
+                                self.lyrics_user_offset = self.lyrics_user_offset.clamp(-(active_line_idx as f32), (max_offset - 1.0 - active_line_idx as f32).max(0.0));
+                                self.lyrics_user_scroll_timer = 2.5; // Snap back after 2.5s of no scroll
+                            } else {
+                                // For unsynced lyrics: allow free, unbounded navigation without snap-back
+                                self.lyrics_user_offset = self.lyrics_user_offset.clamp(0.0, (max_offset - 1.0).max(0.0));
+                                self.lyrics_user_scroll_timer = 0.0;
+                            }
+                        }
+                    }
+
+                    if has_timestamps {
+                        if self.lyrics_user_scroll_timer > 0.0 {
+                            self.lyrics_user_scroll_timer -= dt;
+                            if self.lyrics_user_scroll_timer <= 0.0 {
+                                self.lyrics_user_scroll_timer = 0.0;
+                            }
+                        }
+
+                        // Smoothly ease user_offset back to 0.0 when timer expires
+                        if self.lyrics_user_scroll_timer <= 0.0 && self.lyrics_user_offset.abs() > 0.001 {
+                            self.lyrics_user_offset += (0.0 - self.lyrics_user_offset) * (dt * 8.0).min(1.0);
+                            if self.lyrics_user_offset.abs() < 0.005 {
+                                self.lyrics_user_offset = 0.0;
+                            }
+                        }
+                    }
+
+                    // Target floating line index to center:
+                    // Synced: active_line_idx + manual offset (with 2.5s snap-back)
+                    // Unsynced: lyrics_user_offset directly controls position freely
+                    let target_center_line = if has_timestamps {
+                        (active_line_idx as f32) + self.lyrics_user_offset
+                    } else {
+                        self.lyrics_user_offset
+                    };
+
+                    // Smooth exponential easing for continuous, fluid transitions
+                    let scroll_diff = target_center_line - self.lyrics_scroll_offset;
+                    if scroll_diff.abs() > 8.0 {
+                        self.lyrics_scroll_offset = target_center_line;
+                    } else {
+                        self.lyrics_scroll_offset += scroll_diff * (dt * 10.0).min(1.0);
+                    }
+
+                    // --- SIZING & SPACING LOCKED PROPORTIONALLY TO THE TRACK COVER ---
+                    // Baseline reference: a 480px cover yields exact user settings.
+                    // When the track cover expands or shrinks, the text & spacing scale in lockstep.
+                    let cover_dim = right_rect.width().min(right_rect.height()).max(80.0);
+                    let scale_ratio = cover_dim / 480.0;
+                    let font_size = (self.lyrics_size * scale_ratio).clamp(8.0, 72.0);
+                    let spacing_gap = (self.lyrics_spacing * scale_ratio).clamp(2.0, 64.0);
+                    let center_y = right_rect.center().y;
+                    let text_max_width = (right_rect.width() - (48.0 * scale_ratio).clamp(16.0, 48.0)).max(60.0);
+                    let context_k = self.lyrics_context.clamp(1, 6) as isize;
+                    let align_mode = self.lyrics_align; // 0 = Center, 1 = Left, 2 = Right
+
+                    // Measure all lines once to determine accurate heights for wrapping and position stacking
+                    struct MeasuredLine {
+                        height: f32,
+                        galley: std::sync::Arc<egui::Galley>,
+                    }
+
+                    let font_id = egui::FontId::proportional(font_size);
+                    let measured_all: Vec<MeasuredLine> = parsed_lines.iter().map(|line| {
+                        let galley = ui.painter().layout(
+                            line.text.clone(),
+                            font_id.clone(),
+                            Color32::WHITE,
+                            text_max_width,
+                        );
+                        let height = galley.size().y;
+                        MeasuredLine { height, galley }
+                    }).collect();
+
+                    // Pre-compute the cumulative center Y positions of all lines relative to index 0:
+                    // Y(i+1) = Y(i) + (H(i)/2) + spacing_gap + (H(i+1)/2)
+                    let num_lines = parsed_lines.len();
+                    let mut cumulative_y = vec![0.0f32; num_lines];
+                    for i in 1..num_lines {
+                        let prev_h = measured_all[i - 1].height;
+                        let cur_h = measured_all[i].height;
+                        cumulative_y[i] = cumulative_y[i - 1] + (prev_h * 0.5) + spacing_gap + (cur_h * 0.5);
+                    }
+
+                    // For the continuous floating scroll offset `self.lyrics_scroll_offset` (which can be fractional):
+                    // calculate the current camera reference Y position by interpolating cumulative_y
+                    let target_cam_y = if num_lines == 0 {
+                        0.0
+                    } else {
+                        let clamped_offset = self.lyrics_scroll_offset.clamp(0.0, (num_lines - 1) as f32);
+                        let base_i = clamped_offset.floor() as usize;
+                        let frac = clamped_offset - (base_i as f32);
+                        if base_i + 1 < num_lines {
+                            cumulative_y[base_i] * (1.0 - frac) + cumulative_y[base_i + 1] * frac
+                        } else {
+                            cumulative_y[base_i]
+                        }
+                    };
+
+                    // Visible range determined around current active / scrolled position
+                    let view_line_center = self.lyrics_scroll_offset.round() as isize;
+                    let min_idx = (view_line_center - context_k - 2).max(0) as usize;
+                    let max_idx = (view_line_center + context_k + 2).min((num_lines as isize) - 1).max(0) as usize;
+
+                    let mut seek_to_ratio = None;
+
+                    if !parsed_lines.is_empty() {
+                        for idx in min_idx..=max_idx {
+                            let item = &measured_all[idx];
+                            let line_center_y = center_y + (cumulative_y[idx] - target_cam_y);
+
+                            // Calculate distance in lines or pixels for smooth fading
+                            let line_offset = (idx as f32) - self.lyrics_scroll_offset;
+                            let dist = line_offset.abs();
+                            let max_reach = context_k as f32 + 0.9;
+                            let alpha = (1.0 - (dist / max_reach)).clamp(0.0, 1.0).powf(1.4);
+                            if alpha < 0.01 { continue; }
+
+                            let is_active = has_timestamps && (idx == active_line_idx) && self.lyrics_user_offset.abs() < 0.5;
+                            let g_w = item.galley.size().x;
+                            let g_h = item.height;
+
+                            let text_x = match align_mode {
+                                1 => right_rect.min.x + 24.0, // Left
+                                2 => right_rect.max.x - 24.0 - g_w, // Right
+                                _ => right_rect.center().x - (g_w * 0.5), // Center
+                            };
+
+                            let line_rect = Rect::from_min_size(pos2(text_x, line_center_y - (g_h * 0.5)), Vec2::new(g_w.max(60.0), g_h.max(20.0)));
+                            let resp = ui.interact(line_rect.expand2(Vec2::new(16.0, spacing_gap * 0.4)), ui.id().with(("lyric_line", idx)), egui::Sense::click());
+                            if resp.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                self.lyrics_user_offset = 0.0;
+                                self.lyrics_user_scroll_timer = 0.0;
+                                let line = &parsed_lines[idx];
+                                if let Some(t) = line.time_secs {
+                                    if track_duration > 0.0 {
+                                        seek_to_ratio = Some((t / track_duration).clamp(0.0, 1.0));
+                                    }
+                                } else if !parsed_lines.is_empty() {
+                                    seek_to_ratio = Some(((idx as f64) / (parsed_lines.len() as f64)).clamp(0.0, 1.0));
+                                }
+                            }
+
+                            let final_color = if resp.hovered() {
+                                Color32::WHITE
+                            } else if is_active && line_offset.abs() < 0.4 {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_white_alpha((alpha * 190.0) as u8)
+                            };
+
+                            // Draw line galley with active formatting
+                            let draw_galley = if final_color == Color32::WHITE {
+                                item.galley.clone()
+                            } else {
+                                ui.painter().layout(parsed_lines[idx].text.clone(), font_id.clone(), final_color, text_max_width)
+                            };
+
+                            ui.painter().galley(pos2(text_x, line_center_y - (g_h * 0.5)), draw_galley, final_color);
+                        }
+                    }
+
+                    if let Some(ratio) = seek_to_ratio {
+                        self.progress = ratio as f32;
+                        if let Some(audio) = &self.audio {
+                            self.audio_revision = audio.send(AudioCommand::Seek(self.progress));
+                        }
+                        self.save_current_state();
+                    }
+                } else if let Some(tex) = &self.cover_texture {
                     ui.painter().image(
                         tex.id(),
                         right_rect,
@@ -1485,6 +1509,645 @@ impl DeckApp {
                     );
                 }
             });
+        // ================= FLOATING OVERLAY PLAYER FOOTER =================
+        let control_room = ((ctx.screen_rect().width() - 340.0) / 280.0).clamp(0.0, 1.0);
+        let transport_height = 54.0;
+        let timeline_peek = 4.0; // Show the top of the timeline when unhovered
+        let mut queue_anchor = Rect::NOTHING;
+        let screen = ctx.screen_rect();
+
+        let mouse_pos = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()).or_else(|| i.pointer.interact_pos()));
+
+        // Hysteresis hover detection:
+        // When collapsed (unhovered), require hovering near the timeline / bottom edge (within 24px of screen bottom).
+        // This gives comfortable breathing room from the track list above, preventing premature popups while browsing the playlist.
+        // Once expanded (or expanding), the hit region includes the full transport height (54px) so all controls remain interactive.
+        // If a floating control popup (volume, speed, reverb) is currently open, keep the player footer locked open.
+        let trigger_margin = if self.hover_transition > 0.15 || self.active_floating_control.is_some() || self.queue_open { transport_height + 4.0 } else { 24.0 };
+        let is_bottom_hovered = self.active_floating_control.is_some() || self.queue_open || mouse_pos.map_or(false, |p| {
+            p.y >= screen.max.y - trigger_margin && p.y <= screen.max.y && p.x >= screen.min.x && p.x <= screen.max.x
+        });
+
+        // Smooth hover transition animation (0.0 to 1.0)
+        let target_t = if is_bottom_hovered { 1.0 } else { 0.0 };
+        let dt = ctx.input(|i| i.stable_dt).max(1.0 / 60.0).min(0.1);
+        self.hover_transition = (self.hover_transition + (target_t - self.hover_transition) * (dt * 15.0).min(1.0)).clamp(0.0, 1.0);
+
+        if self.floating_control_timer > 0.0 {
+            self.floating_control_timer -= dt;
+            if self.floating_control_timer <= 0.0 {
+                self.active_floating_control = None;
+            }
+        }
+
+        // When hover_transition is 0.0, bar_top_y rests at (screen.max.y - timeline_peek),
+        // showing the slim glowing timeline right along the bottom edge of the window.
+        // When hovered (transition = 1.0), it smoothly rises up to (screen.max.y - transport_height).
+        let current_rise = timeline_peek + (transport_height - timeline_peek) * self.hover_transition;
+        let bar_top_y = screen.max.y - current_rise;
+        let panel_rect = Rect::from_min_max(pos2(screen.min.x, bar_top_y), pos2(screen.max.x, bar_top_y + transport_height));
+
+        egui::Area::new(egui::Id::new("floating_transport_bar"))
+            .fixed_pos(panel_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(panel_rect);
+                ui.painter().rect_filled(panel_rect, Rounding::ZERO, colors.background);
+                // ---------------- YOUTUBE-STYLE INTERACTIVE SEEKBAR ON TOP ----------------
+                let bar_thickness = 3.0 + (3.0 * self.hover_transition);
+                let hit_height = 16.0;
+                let seek_y = panel_rect.min.y + bar_thickness * 0.5;
+
+                let seek_hit_rect = Rect::from_min_size(
+                    panel_rect.min,
+                    Vec2::new(panel_rect.width(), hit_height),
+                );
+
+                let seek_visual_rect = Rect::from_center_size(
+                    pos2(panel_rect.center().x, seek_y),
+                    Vec2::new(panel_rect.width(), bar_thickness),
+                );
+
+                let seek_response = ui.interact(seek_hit_rect, ui.id().with("seekbar"), egui::Sense::click_and_drag());
+
+                // Track background: Solid matching color, no white gap
+                ui.painter().rect_filled(seek_visual_rect, Rounding::ZERO, colors.track_bg);
+
+                // Elapsed fill: Solid accent orange
+                let filled_width = (panel_rect.width() * self.progress.clamp(0.0, 1.0)).max(0.0);
+                let progress_rect = Rect::from_min_size(
+                    seek_visual_rect.min,
+                    Vec2::new(filled_width, bar_thickness),
+                );
+                ui.painter().rect_filled(progress_rect, Rounding::ZERO, colors.accent);
+
+                // YouTube-style playhead circle: solid accent orange without white outline
+                let head_radius = (5.5 * self.hover_transition).max(0.0);
+                if head_radius > 0.5 {
+                    let playhead_pos = pos2((seek_visual_rect.min.x + filled_width).clamp(panel_rect.min.x + head_radius, panel_rect.max.x - head_radius), seek_visual_rect.center().y);
+                    // Let the thumb overlap the artwork edge without adding a blank
+                    // strip above the track or clipping the upper half of the circle.
+                    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("seek_thumb")))
+                        .with_clip_rect(ctx.screen_rect()).circle_filled(
+                        playhead_pos,
+                        head_radius,
+                        colors.accent,
+                    );
+                }
+
+                // Dragging previews locally. Commit exactly one seek at release, and
+                // reject old telemetry until the playback worker acknowledges its revision.
+                if seek_response.drag_started() { self.is_scrubbing = true; }
+                if seek_response.clicked() || seek_response.dragged() || seek_response.drag_stopped() {
+                    if let Some(pt) = seek_response.interact_pointer_pos() {
+                        self.progress = ((pt.x - seek_visual_rect.min.x) / seek_visual_rect.width()).clamp(0.0, 1.0);
+                    }
+                }
+                if seek_response.drag_stopped() || seek_response.clicked() {
+                    self.is_scrubbing = false;
+                    if let Some(audio) = &self.audio {
+                        self.audio_revision = audio.send(AudioCommand::Seek(self.progress));
+                    }
+                    self.save_current_state();
+                }
+
+                // Strictly center all controls vertically between seekbar and bottom edge
+                let content_alpha = ((self.hover_transition - 0.2) / 0.8).clamp(0.0, 1.0);
+                let slide_offset = (1.0 - self.hover_transition) * 48.0;
+                let center_y = panel_rect.min.y + 32.0 + slide_offset;
+                let btn_size = 22.0;
+
+                // When unhovered, the controls smoothly slide down into hiding, showing just the timeline.
+                // We keep controls interactive only when visible enough.
+                if content_alpha > 0.05 {
+
+                // --- 1. LEFT ZONE: [🔀] [⚙] (uniform 12px gap, aligned to exact center_y) ---
+                let left_margin = 8.0 + 6.0 * control_room;
+                let left_gap = 8.0 + 4.0 * control_room;
+
+                let shuf_rect = Rect::from_center_size(pos2(panel_rect.min.x + left_margin + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let shuf_resp = ui.allocate_rect(shuf_rect, egui::Sense::click());
+                let shuf_color = if self.shuffle_enabled { colors.accent } else if shuf_resp.hovered() { colors.text } else { colors.muted };
+                
+                // Pixel-perfect vector shuffle icon
+                {
+                    let p = ui.painter();
+                    let stroke = Stroke::new(1.6, shuf_color);
+                    let c = shuf_rect.center();
+                    // Top crossover arrow: (-6, -4) -> (-1, -4) -> (2, 4) -> (6, 4)
+                    p.line_segment([pos2(c.x - 6.0, c.y - 3.5), pos2(c.x - 2.0, c.y - 3.5)], stroke);
+                    p.line_segment([pos2(c.x - 2.0, c.y - 3.5), pos2(c.x + 2.0, c.y + 3.5)], stroke);
+                    p.line_segment([pos2(c.x + 2.0, c.y + 3.5), pos2(c.x + 6.0, c.y + 3.5)], stroke);
+                    // Arrowhead bottom:
+                    p.line_segment([pos2(c.x + 3.5, c.y + 1.0), pos2(c.x + 6.0, c.y + 3.5)], stroke);
+                    p.line_segment([pos2(c.x + 3.5, c.y + 6.0), pos2(c.x + 6.0, c.y + 3.5)], stroke);
+
+                    // Bottom crossover arrow: (-6, 4) -> (-1, 4) -> (2, -4) -> (6, -4)
+                    p.line_segment([pos2(c.x - 6.0, c.y + 3.5), pos2(c.x - 2.0, c.y + 3.5)], stroke);
+                    p.line_segment([pos2(c.x - 2.0, c.y + 3.5), pos2(c.x + 2.0, c.y - 3.5)], stroke);
+                    p.line_segment([pos2(c.x + 2.0, c.y - 3.5), pos2(c.x + 6.0, c.y - 3.5)], stroke);
+                    // Arrowhead top:
+                    p.line_segment([pos2(c.x + 3.5, c.y - 6.0), pos2(c.x + 6.0, c.y - 3.5)], stroke);
+                    p.line_segment([pos2(c.x + 3.5, c.y - 1.0), pos2(c.x + 6.0, c.y - 3.5)], stroke);
+                }
+
+                if shuf_resp.clicked() {
+                    self.shuffle_enabled = !self.shuffle_enabled;
+                    self.rebuild_shuffle_order(self.selected_idx);
+                    self.save_current_state();
+                }
+
+                let set_rect = Rect::from_center_size(pos2(shuf_rect.max.x + left_gap + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let set_resp = ui.allocate_rect(set_rect, egui::Sense::click());
+                let set_color = if set_resp.hovered() { colors.text } else { colors.muted };
+                
+                for offset in [-5.0, 0.0, 5.0] {
+                    let c = set_rect.center();
+                    ui.painter().line_segment([pos2(c.x - 5.0, c.y + offset), pos2(c.x + 6.0, c.y + offset)], Stroke::new(1.5, set_color));
+                    ui.painter().circle_filled(pos2(c.x - 8.0, c.y + offset), 1.0, set_color);
+                }
+                queue_anchor = set_rect;
+                if set_resp.clicked() {
+                    self.queue_open = !self.queue_open;
+                    self.queue_drag = None;
+                    if self.queue_open { self.speed_open = false; self.reverb_open = false; }
+                }
+                set_resp.on_hover_text("Queue: view the current mix");
+
+                // Toggle for Lyrics beside Queue
+                let lyric_rect = Rect::from_center_size(pos2(set_rect.max.x + left_gap + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let lyric_resp = ui.allocate_rect(lyric_rect, egui::Sense::click());
+                let has_lyrics = self.current_meta.as_ref().map_or(false, |m| m.lyrics.is_some());
+                let lyric_color = if self.lyrics_open {
+                    colors.accent
+                } else if lyric_resp.hovered() {
+                    colors.text
+                } else if has_lyrics {
+                    colors.text
+                } else {
+                    colors.muted
+                };
+
+                // Lyrics icon: text quote / note icon
+                {
+                    let p = ui.painter();
+                    let c = lyric_rect.center();
+                    // Draw a neat speech bubble / lyrics symbol
+                    p.rect_stroke(Rect::from_center_size(pos2(c.x, c.y - 1.0), Vec2::new(14.0, 11.0)), Rounding::same(2.0), Stroke::new(1.4, lyric_color));
+                    p.line_segment([pos2(c.x - 3.5, c.y - 2.5), pos2(c.x + 3.5, c.y - 2.5)], Stroke::new(1.2, lyric_color));
+                    p.line_segment([pos2(c.x - 3.5, c.y + 0.5), pos2(c.x + 2.0, c.y + 0.5)], Stroke::new(1.2, lyric_color));
+                }
+                if lyric_resp.clicked() {
+                    self.lyrics_open = !self.lyrics_open;
+                }
+                lyric_resp.on_hover_text(if has_lyrics { "Toggle lyrics" } else { "No lyrics available in track" });
+
+                // --- 2. EXACT CENTER ZONE: [⏮] [▶/⏸] [⏭] (uniform 14px gap, aligned to exact center_y) ---
+                let center_x = panel_rect.center().x;
+                let center_gap = 8.0 + 6.0 * control_room;
+
+                let play_rect = Rect::from_center_size(pos2(center_x, center_y), Vec2::splat(btn_size));
+                let prev_rect = Rect::from_center_size(pos2(play_rect.min.x - center_gap - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let next_rect = Rect::from_center_size(pos2(play_rect.max.x + center_gap + (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+
+                // Previous
+                let prev_resp = ui.allocate_rect(prev_rect, egui::Sense::click());
+                let prev_color = if prev_resp.is_pointer_button_down_on() { colors.accent } else if prev_resp.hovered() { colors.text } else { colors.text };
+                {
+                    let p = ui.painter();
+                    let c = prev_rect.center();
+                    // Left bar:
+                    p.rect_filled(Rect::from_center_size(pos2(c.x - 5.0, c.y), Vec2::new(2.0, 11.0)), Rounding::ZERO, prev_color);
+                    // Left triangle:
+                    let p1 = pos2(c.x - 3.5, c.y);
+                    let p2 = pos2(c.x + 5.0, c.y - 5.5);
+                    let p3 = pos2(c.x + 5.0, c.y + 5.5);
+                    p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], prev_color, Stroke::NONE));
+                }
+                if prev_resp.clicked() {
+                    self.prev_track();
+                }
+
+                // Play / Pause
+                let play_resp = ui.allocate_rect(play_rect, egui::Sense::click());
+                let play_color = if play_resp.is_pointer_button_down_on() { colors.accent } else if play_resp.hovered() { colors.text } else { colors.text };
+                {
+                    let p = ui.painter();
+                    let c = play_rect.center();
+                    if self.is_playing {
+                        // Pause: two solid bars
+                        p.rect_filled(Rect::from_center_size(pos2(c.x - 3.0, c.y), Vec2::new(3.0, 12.0)), Rounding::ZERO, play_color);
+                        p.rect_filled(Rect::from_center_size(pos2(c.x + 3.0, c.y), Vec2::new(3.0, 12.0)), Rounding::ZERO, play_color);
+                    } else {
+                        // Play: right-pointing triangle centered mathematically
+                        let p1 = pos2(c.x - 4.5, c.y - 6.5);
+                        let p2 = pos2(c.x - 4.5, c.y + 6.5);
+                        let p3 = pos2(c.x + 5.5, c.y);
+                        p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], play_color, Stroke::NONE));
+                    }
+                }
+                if play_resp.clicked() {
+                    if let Some(audio) = &self.audio {
+                        audio.send(AudioCommand::Toggle);
+                    }
+                }
+
+                // Next
+                let next_resp = ui.allocate_rect(next_rect, egui::Sense::click());
+                let next_color = if next_resp.is_pointer_button_down_on() { colors.accent } else if next_resp.hovered() { colors.text } else { colors.text };
+                {
+                    let p = ui.painter();
+                    let c = next_rect.center();
+                    // Right-pointing triangle:
+                    let p1 = pos2(c.x - 5.0, c.y - 5.5);
+                    let p2 = pos2(c.x - 5.0, c.y + 5.5);
+                    let p3 = pos2(c.x + 3.5, c.y);
+                    p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], next_color, Stroke::NONE));
+                    // Right bar:
+                    p.rect_filled(Rect::from_center_size(pos2(c.x + 5.0, c.y), Vec2::new(2.0, 11.0)), Rounding::ZERO, next_color);
+                }
+                if next_resp.clicked() {
+                    self.next_track();
+                }
+
+                // --- 3. RIGHT ZONE: [Volume (Icon)] [Speed (1x)] [Reverb (~)] (uniform 12px gap, aligned to exact center_y) ---
+                let right_margin = 8.0 + 6.0 * control_room;
+                let right_gap = 8.0 + 6.0 * control_room;
+
+                // Helper closure for non-linear dynamic scroll scaling:
+                // Standard Windows wheel delta is ~50.0 to 120.0 per physical tick.
+                // Single slow tick (norm ~ 1.0): moves precisely 0.01 (1% volume/reverb, 0.01x speed).
+                // Fast spin (norm ~ 3.0 to 5.0+): smoothly accelerates up to 5x faster (0.05 / 5% per tick).
+                let dynamic_scroll_step = |raw_delta: f32, base_rate: f32| -> f32 {
+                    let mag = raw_delta.abs();
+                    let norm = (mag / 50.0).max(1.0);
+                    let factor = (norm * norm * 0.5 + 0.5).clamp(1.0, 5.0);
+                    raw_delta.signum() * base_rate * factor
+                };
+
+                // Reverb Icon (Minimalist "~" wave icon)
+                let rev_rect = Rect::from_center_size(pos2(panel_rect.max.x - right_margin - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let rev_resp = ui.allocate_rect(rev_rect, egui::Sense::click());
+                let rev_color = if self.active_floating_control == Some(FloatingControlType::Reverb) || self.reverb_amount > 0.01 { colors.accent } else if rev_resp.hovered() { colors.text } else { colors.muted };
+                ui.painter().text(rev_rect.center(), egui::Align2::CENTER_CENTER, "~", egui::FontId::monospace(15.0), rev_color);
+                if rev_resp.clicked() {
+                    if self.active_floating_control == Some(FloatingControlType::Reverb) {
+                        self.active_floating_control = None;
+                    } else {
+                        self.active_floating_control = Some(FloatingControlType::Reverb);
+                        self.floating_control_timer = 0.0;
+                    }
+                }
+                if rev_resp.hovered() {
+                    let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
+                    if scroll_delta.abs() > 0.01 {
+                        let step = dynamic_scroll_step(scroll_delta, 0.01);
+                        self.reverb_amount = (self.reverb_amount + step).clamp(0.0, 1.0);
+                        if let Some(audio) = &self.audio {
+                            audio.send(AudioCommand::SetReverb(self.reverb_amount));
+                        }
+                        self.save_current_state();
+                        self.active_floating_control = Some(FloatingControlType::Reverb);
+                        self.floating_control_timer = 1.6;
+                    }
+                }
+
+                // Speed Icon (Dynamic speed text based on active playback speed)
+                let spd_rect = Rect::from_center_size(pos2(rev_rect.min.x - right_gap - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let spd_resp = ui.allocate_rect(spd_rect, egui::Sense::click());
+                let spd_color = if self.active_floating_control == Some(FloatingControlType::Speed) || (self.speed - 1.0).abs() > 0.01 { colors.accent } else if spd_resp.hovered() { colors.text } else { colors.muted };
+                let spd_text = if (self.speed - 1.0).abs() < 0.01 {
+                    "1x".to_string()
+                } else if ((self.speed * 10.0).round() - (self.speed * 10.0)).abs() < 0.01 {
+                    format!("{:.1}x", self.speed)
+                } else {
+                    format!("{:.2}x", self.speed)
+                };
+                ui.painter().text(spd_rect.center(), egui::Align2::CENTER_CENTER, spd_text, egui::FontId::monospace(10.5), spd_color);
+                if spd_resp.clicked() {
+                    if self.active_floating_control == Some(FloatingControlType::Speed) {
+                        self.active_floating_control = None;
+                    } else {
+                        self.active_floating_control = Some(FloatingControlType::Speed);
+                        self.floating_control_timer = 0.0;
+                    }
+                }
+                if spd_resp.hovered() {
+                    let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
+                    if scroll_delta.abs() > 0.01 {
+                        let step = dynamic_scroll_step(scroll_delta, 0.01);
+                        self.speed = (self.speed + step).clamp(0.5, 1.5);
+                        if let Some(audio) = &self.audio {
+                            audio.send(AudioCommand::SetSpeed(self.speed));
+                        }
+                        self.save_current_state();
+                        self.active_floating_control = Some(FloatingControlType::Speed);
+                        self.floating_control_timer = 1.6;
+                    }
+                }
+
+                // Volume Icon (Crisp vector speaker icon)
+                let vol_icon_rect = Rect::from_center_size(pos2(spd_rect.min.x - right_gap - (btn_size * 0.5), center_y), Vec2::splat(btn_size));
+                let vol_icon_resp = ui.allocate_rect(vol_icon_rect, egui::Sense::click());
+                let vol_color = if vol_icon_resp.hovered() || self.active_floating_control == Some(FloatingControlType::Volume) {
+                    colors.accent
+                } else if self.volume > 0.001 {
+                    colors.text
+                } else {
+                    colors.muted
+                };
+
+                // Draw speaker icon
+                {
+                    let p = ui.painter();
+                    let c = vol_icon_rect.center();
+                    // Speaker body
+                    let body_rect = Rect::from_center_size(pos2(c.x - 3.5, c.y), Vec2::new(3.0, 5.0));
+                    p.rect_filled(body_rect, Rounding::ZERO, vol_color);
+                    // Cone polygon
+                    let cone = vec![
+                        pos2(c.x - 2.0, c.y - 2.5),
+                        pos2(c.x + 2.0, c.y - 6.0),
+                        pos2(c.x + 2.0, c.y + 6.0),
+                        pos2(c.x - 2.0, c.y + 2.5),
+                    ];
+                    p.add(egui::Shape::convex_polygon(cone, vol_color, Stroke::NONE));
+
+                    if self.volume <= 0.001 {
+                        // Muted 'x' mark
+                        p.line_segment([pos2(c.x + 4.0, c.y - 3.0), pos2(c.x + 7.5, c.y + 3.0)], Stroke::new(1.3, vol_color));
+                        p.line_segment([pos2(c.x + 7.5, c.y - 3.0), pos2(c.x + 4.0, c.y + 3.0)], Stroke::new(1.3, vol_color));
+                    } else {
+                        // Sound wave arc
+                        p.line_segment([pos2(c.x + 4.5, c.y - 3.0), pos2(c.x + 6.0, c.y)], Stroke::new(1.3, vol_color));
+                        p.line_segment([pos2(c.x + 6.0, c.y), pos2(c.x + 4.5, c.y + 3.0)], Stroke::new(1.3, vol_color));
+                        if self.volume > 0.5 {
+                            p.line_segment([pos2(c.x + 7.0, c.y - 5.0), pos2(c.x + 9.0, c.y)], Stroke::new(1.3, vol_color));
+                            p.line_segment([pos2(c.x + 9.0, c.y), pos2(c.x + 7.0, c.y + 5.0)], Stroke::new(1.3, vol_color));
+                        }
+                    }
+                }
+
+                if vol_icon_resp.clicked() {
+                    // Click toggles floating preview (timer = 0 so it stays open until toggled or dismissed)
+                    if self.active_floating_control == Some(FloatingControlType::Volume) {
+                        self.active_floating_control = None;
+                    } else {
+                        self.active_floating_control = Some(FloatingControlType::Volume);
+                        self.floating_control_timer = 0.0;
+                    }
+                }
+
+                // Scroll wheel on volume icon (dynamic acceleration: fine when slow, fast when spun)
+                if vol_icon_resp.hovered() {
+                    let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
+                    if scroll_delta.abs() > 0.01 {
+                        let step = dynamic_scroll_step(scroll_delta, 0.01);
+                        self.volume = (self.volume + step).clamp(0.0, 1.0);
+                        if let Some(audio) = &self.audio {
+                            audio.send(AudioCommand::SetVolume(self.volume));
+                        }
+                        self.save_current_state();
+                        self.active_floating_control = Some(FloatingControlType::Volume);
+                        self.floating_control_timer = 1.6;
+                    }
+                }
+
+                // --- VERTICAL FLOATING PREVIEW SLIDER POPUP WITH VALUE BELOW ---
+                if let Some(ctrl_type) = self.active_floating_control {
+                    let anchor_rect = match ctrl_type {
+                        FloatingControlType::Volume => vol_icon_rect,
+                        FloatingControlType::Speed => spd_rect,
+                        FloatingControlType::Reverb => rev_rect,
+                    };
+                    let title = match ctrl_type {
+                        FloatingControlType::Volume => "VOLUME",
+                        FloatingControlType::Speed => "SPEED",
+                        FloatingControlType::Reverb => "REVERB",
+                    };
+                    let popup_w = 46.0;
+                    let popup_h = 138.0;
+                    let popup_x = (anchor_rect.center().x - popup_w * 0.5).clamp(8.0, panel_rect.max.x - popup_w - 8.0);
+                    let popup_pos = pos2(popup_x, panel_rect.min.y - popup_h - 10.0);
+
+                    let popup_resp = egui::Area::new(egui::Id::new("floating_vertical_slider_preview"))
+                        .fixed_pos(popup_pos)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style())
+                                .fill(colors.card)
+                                .stroke(Stroke::new(1.0, colors.border))
+                                .rounding(Rounding::same(4.0))
+                                .inner_margin(egui::Margin::symmetric(6.0, 8.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(popup_w - 12.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(egui::RichText::new(title).size(8.5).strong().color(colors.muted));
+                                        ui.add_space(6.0);
+
+                                        // Vertical slider track: height 72.0, width 14.0 hit box
+                                        let track_len = 72.0;
+                                        let (s_rect, s_resp) = ui.allocate_exact_size(Vec2::new(16.0, track_len), egui::Sense::click_and_drag());
+
+                                        let current_frac = match ctrl_type {
+                                            FloatingControlType::Volume => self.volume.clamp(0.0, 1.0),
+                                            FloatingControlType::Speed => ((self.speed - 0.5) / 1.0).clamp(0.0, 1.0),
+                                            FloatingControlType::Reverb => self.reverb_amount.clamp(0.0, 1.0),
+                                        };
+
+                                        // Drag interaction (bottom is 0.0, top is 1.0)
+                                        if s_resp.clicked() || s_resp.dragged() {
+                                            self.floating_control_timer = 2.0; // Refresh dismissal timer while interacting
+                                            if let Some(pt) = s_resp.interact_pointer_pos() {
+                                                let new_frac = (1.0 - (pt.y - s_rect.min.y) / track_len).clamp(0.0, 1.0);
+                                                match ctrl_type {
+                                                    FloatingControlType::Volume => {
+                                                        self.volume = new_frac;
+                                                        if let Some(audio) = &self.audio { audio.send(AudioCommand::SetVolume(self.volume)); }
+                                                    }
+                                                    FloatingControlType::Speed => {
+                                                        self.speed = 0.5 + (new_frac * 1.0);
+                                                        if let Some(audio) = &self.audio { audio.send(AudioCommand::SetSpeed(self.speed)); }
+                                                    }
+                                                    FloatingControlType::Reverb => {
+                                                        self.reverb_amount = new_frac;
+                                                        if let Some(audio) = &self.audio { audio.send(AudioCommand::SetReverb(self.reverb_amount)); }
+                                                    }
+                                                }
+                                                self.save_current_state();
+                                            }
+                                        }
+
+                                        // Scroll wheel inside popup
+                                        if s_resp.hovered() {
+                                            let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
+                                            if scroll_delta.abs() > 0.01 {
+                                                let step = dynamic_scroll_step(scroll_delta, 0.01);
+                                                match ctrl_type {
+                                                    FloatingControlType::Volume => {
+                                                        self.volume = (self.volume + step).clamp(0.0, 1.0);
+                                                        if let Some(audio) = &self.audio { audio.send(AudioCommand::SetVolume(self.volume)); }
+                                                    }
+                                                    FloatingControlType::Speed => {
+                                                        self.speed = (self.speed + step).clamp(0.5, 1.5);
+                                                        if let Some(audio) = &self.audio { audio.send(AudioCommand::SetSpeed(self.speed)); }
+                                                    }
+                                                    FloatingControlType::Reverb => {
+                                                        self.reverb_amount = (self.reverb_amount + step).clamp(0.0, 1.0);
+                                                        if let Some(audio) = &self.audio { audio.send(AudioCommand::SetReverb(self.reverb_amount)); }
+                                                    }
+                                                }
+                                                self.save_current_state();
+                                            }
+                                        }
+
+                                        // Render vertical track background
+                                        let bar_w = 3.0;
+                                        let bar_center_x = s_rect.center().x;
+                                        let track_rect = Rect::from_center_size(pos2(bar_center_x, s_rect.center().y), Vec2::new(bar_w, track_len));
+                                        ui.painter().rect_filled(track_rect, Rounding::same(1.5), colors.track_bg);
+
+                                        // Render active fill from bottom up
+                                        let fill_h = track_len * current_frac;
+                                        let fill_rect = Rect::from_min_max(
+                                            pos2(bar_center_x - bar_w * 0.5, track_rect.max.y - fill_h),
+                                            pos2(bar_center_x + bar_w * 0.5, track_rect.max.y),
+                                        );
+                                        ui.painter().rect_filled(fill_rect, Rounding::same(1.5), colors.accent);
+
+                                        // Thumb circle
+                                        let thumb_y = track_rect.max.y - fill_h;
+                                        ui.painter().circle_filled(pos2(bar_center_x, thumb_y), 4.5, colors.accent);
+
+                                        ui.add_space(6.0);
+
+                                        // Value display below the vertical slider
+                                        let val_text = match ctrl_type {
+                                            FloatingControlType::Volume => format!("{:.0}%", self.volume * 100.0),
+                                            FloatingControlType::Speed => format!("{:.2}x", self.speed),
+                                            FloatingControlType::Reverb => format!("{:.0}%", self.reverb_amount * 100.0),
+                                        };
+                                        ui.label(egui::RichText::new(val_text).size(9.5).color(colors.text));
+                                    });
+                                });
+                        });
+
+                    if popup_resp.response.hovered() {
+                        self.floating_control_timer = 2.0; // Keep alive while mouse inside popup
+                    }
+                    if dismiss_popup(ctx, popup_resp.response.rect, anchor_rect) {
+                        self.active_floating_control = None;
+                    }
+                }
+
+                } // end if content_alpha > 0.05
+
+            });
+
+        if let Some(message) = self.audio_error.clone() {
+            egui::Window::new("Audio playback error").collapsible(false).show(ctx, |ui| {
+                ui.label(message);
+                if ui.button("Dismiss").clicked() { self.audio_error = None; }
+            });
+        }
+
+        if self.queue_open {
+            let rows: Vec<_> = self.shuffle_order.iter().enumerate().filter_map(|(position, &index)|
+                self.playlist.get(index).map(|t| (position, index, t.title.clone(), t.artist.clone()))).collect();
+            let mut jump = None;
+            let mut promote = None;
+            let mut insertion = None;
+            let mut queue_context_rect = Rect::NOTHING;
+            let popup_width = 320.0f32.min(ctx.screen_rect().width() - 32.0);
+            let list_height = (rows.len() as f32 * 30.0).max(28.0).min((ctx.screen_rect().height() * 0.5).min(320.0));
+            let popup = egui::Area::new(egui::Id::new("queue_popup"))
+                .movable(false)
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos2(8.0, ctx.screen_rect().max.y - transport_height - 8.0 - list_height - 36.0)).constrain(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).fill(colors.card)
+                        .stroke(Stroke::new(1.0, colors.border)).rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+                            ui.set_width(popup_width);
+                            ui.label(egui::RichText::new("QUEUE").size(9.0).strong().color(colors.muted));
+                            if rows.is_empty() { ui.label("Queue is empty"); }
+                            egui::ScrollArea::vertical().id_source("queue_tracks")
+                                .drag_to_scroll(false)
+                                .max_height(list_height).min_scrolled_height(list_height)
+                                .auto_shrink([false, false]).show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    for (position, index, title, artist) in rows {
+                                        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::hover());
+                                        let handle = Rect::from_min_size(row.min, Vec2::new(22.0, row.height()));
+                                        let response = ui.interact(handle, ui.id().with(("queue_drag", index)), egui::Sense::drag());
+                                        if response.drag_started() { self.queue_drag = Some(index); }
+                                        if response.hovered() { ctx.set_cursor_icon(egui::CursorIcon::Grab); }
+                                        let active = self.queue_drag == Some(index);
+                                        if active { ui.painter().rect_stroke(row.shrink(1.0), Rounding::same(2.0), Stroke::new(1.0, colors.accent)); }
+                                        let handle_color = if active || response.hovered() { colors.accent } else { colors.muted };
+                                        for x in [-2.5, 2.5] { for y in [-5.0, 0.0, 5.0] {
+                                            ui.painter().circle_filled(handle.center() + Vec2::new(x, y), 1.2, handle_color);
+                                        }}
+                                        let text_rect = Rect::from_min_max(pos2(handle.max.x + 4.0, row.min.y), row.max);
+                                        let marker = if self.selected_idx == Some(index) { ">" } else if self.user_queue.contains(&index) { "+" } else { "" };
+                                        let label = ui.allocate_ui_at_rect(text_rect, |ui| {
+                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.add(egui::Label::new(format!("{} {}. {} - {}", marker, position + 1, title, artist)).truncate(true).sense(egui::Sense::click()))
+                                            }).inner
+                                        }).inner;
+                                        if label.double_clicked() { jump = Some((position, index)); }
+                                        if let Some(menu) = label.context_menu(|ui| {
+                                            if ui.button("Play next").clicked() { promote = Some(index); ui.close_menu(); }
+                                        }) { queue_context_rect = menu.response.rect; }
+                                        if self.queue_drag.is_some() {
+                                            if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
+                                                if row.contains(pointer) && ui.clip_rect().contains(pointer) {
+                                                    let after = pointer.y > row.center().y;
+                                                    insertion = Some(position + usize::from(after));
+                                                    let y = if after { row.max.y } else { row.min.y };
+                                                    ui.painter().line_segment([pos2(row.min.x, y), pos2(row.max.x, y)], Stroke::new(2.0, colors.accent));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if self.queue_drag.is_some() {
+                                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                                        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                                        if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
+                                            let viewport = ui.clip_rect();
+                                            if viewport.contains(pointer) {
+                                                let delta = if pointer.y < viewport.top() + 24.0 { 6.0 } else if pointer.y > viewport.bottom() - 24.0 { -6.0 } else { 0.0 };
+                                                ui.scroll_with_delta(Vec2::new(0.0, delta));
+                                            }
+                                        }
+                                    }
+                                });
+                        });
+                });
+            if ctx.input(|i| i.pointer.any_released()) {
+                if let (Some(index), Some(position)) = (self.queue_drag.take(), insertion) { self.move_queue_track(index, position); }
+            }
+            if dismiss_popup(ctx, popup.response.rect.union(queue_context_rect), queue_anchor) {
+                self.queue_open = false;
+                self.queue_drag = None;
+            }
+            if let Some(index) = promote { self.play_next(index); }
+            if let Some((position, index)) = jump {
+                self.shuffle_pos = position;
+                self.play_track_at_index(index, false);
+            }
+        } else { self.queue_drag = None; }
+
+        if self.settings_open {
+            ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("deck_preferences"),
+                egui::ViewportBuilder::default().with_title("DECK Preferences")
+                    .with_inner_size([560.0, 360.0]).with_min_inner_size([440.0, 280.0])
+                    .with_resizable(true), |ctx, class| {
+                    if class == egui::ViewportClass::Embedded { return; }
+                    self.preferences_ui(ctx);
+                    if ctx.input(|i| i.viewport().close_requested()) { self.settings_open = false; }
+                });
+        }
     }
 }
 
@@ -1505,7 +2168,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 480.0])
-            .with_min_inner_size([340.0, 360.0])
+            .with_min_inner_size([340.0, 340.0])
             .with_title("DECK"),
         ..Default::default()
     };
@@ -1524,7 +2187,7 @@ mod layout_tests {
     fn preferences_categories_select_separate_right_hand_settings() {
         let ctx = egui::Context::default();
         let mut app = DeckApp::from_saved(SavedConfig::default(), None);
-        for section in [0, 1] {
+        for section in [0, 1, 2] {
             app.settings_section = section;
             let output = ctx.run(egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(560.0, 360.0))),
@@ -1534,12 +2197,18 @@ mod layout_tests {
                 egui::Shape::Text(text) => Some((text.galley.text(), text.pos.x)),
                 _ => None,
             }).collect();
-            for category in ["Library", "Appearance"] {
+            for category in ["Library", "Appearance", "Lyrics"] {
                 assert!(text_positions.iter().any(|(text, x)| *text == category && *x < 136.0));
             }
-            let settings = if section == 0 { vec!["Music folder", "Choose folder", "Rescan"] } else { vec!["Theme", "Accent color"] };
+            let settings = if section == 0 {
+                vec!["Music folder", "Choose folder", "Rescan"]
+            } else if section == 1 {
+                vec!["Theme", "Accent color"]
+            } else {
+                vec!["Font size", "Line spacing", "Context lines (before / after)", "Text alignment"]
+            };
             for setting in settings {
-                assert!(text_positions.iter().any(|(text, x)| *text == setting && *x >= 136.0), "missing setting {setting}");
+                assert!(text_positions.iter().any(|(text, x)| *text.to_lowercase() == setting.to_lowercase() && *x >= 136.0), "missing setting {setting}");
             }
             let absent = if section == 0 { "Accent color" } else { "Music folder" };
             assert!(!text_positions.iter().any(|(text, _)| *text == absent));
@@ -1725,11 +2394,14 @@ mod layout_tests {
             let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(width, height));
             let dock_top = height - 54.0;
             app.hover_transition = 1.0;
-            let output = ctx.run(egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerMoved(pos2(width * 0.5, dock_top + 2.0))],
-                ..Default::default()
-            }, |ctx| app.update_ui(ctx));
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = ctx.run(egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(pos2(width * 0.5, dock_top + 2.0))],
+                    ..Default::default()
+                }, |ctx| app.update_ui(ctx));
+            }
             let seek_index = output.shapes.iter().position(|shape| matches!(&shape.shape,
                 egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(0xD8, 0xD0, 0xC4)
                     && (rect.rect.width() - width).abs() < 0.1
@@ -1786,10 +2458,14 @@ mod layout_tests {
         let frame = |app: &mut DeckApp, events: Vec<egui::Event>| {
             let _ = ctx.run(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ctx| app.update_ui(ctx));
         };
-        for _ in 0..3 { frame(&mut app, vec![]); }
+        // Wake and expand the floating transport footer to test seeking
+        for _ in 0..20 {
+            frame(&mut app, vec![egui::Event::PointerMoved(pos2(100.0, 480.0 - 10.0))]);
+        }
         let y = 480.0 - 54.0 + 7.0;
         let button = |x, pressed| egui::Event::PointerButton { pos: pos2(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
-        frame(&mut app, vec![egui::Event::PointerMoved(pos2(100.0, y)), button(100.0, true)]);
+        for _ in 0..5 { frame(&mut app, vec![egui::Event::PointerMoved(pos2(100.0, y))]); }
+        frame(&mut app, vec![button(100.0, true)]);
         for x in [200.0, 500.0, 300.0, 600.0] {
             frame(&mut app, vec![egui::Event::PointerMoved(pos2(x, y))]);
         }
@@ -1812,20 +2488,24 @@ mod layout_tests {
         for (width, height) in [(340.0, 360.0), (340.0, 640.0), (519.0, 700.0), (520.0, 360.0), (550.0, 600.0), (580.0, 600.0), (619.0, 600.0), (720.0, 480.0)] {
             let ctx = egui::Context::default();
             let mut app = DeckApp::from_saved(SavedConfig::default(), None);
-            app.hover_transition = 1.0;
             let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(width, height));
+            let dock_top = height - 54.0;
             let mut shapes = Vec::new();
-            for _ in 0..3 {
-                let output = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| app.update_ui(ctx));
+            // Hover near bottom edge so the floating footer smoothly expands
+            for _ in 0..20 {
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(pos2(width * 0.5, height - 10.0))],
+                    ..Default::default()
+                }, |ctx| app.update_ui(ctx));
                 shapes = output.shapes;
             }
-            let dock_top = height - 54.0;
             let mut volume_bounds = None;
             let mut transport_bounds = Vec::new();
             for clipped in shapes {
                 match &clipped.shape {
-                    egui::Shape::Circle(circle) if circle.fill == WarmIndustrialTheme::ACCENT_ORANGE && circle.center.y > dock_top => {
-                        let bounds = Rect::from_center_size(circle.center, Vec2::splat(circle.radius * 2.0));
+                    egui::Shape::Rect(rect) if rect.fill == WarmIndustrialTheme::palette(0, 0).text && rect.rect.center().y > dock_top && rect.rect.center().x > width * 0.6 => {
+                        let bounds = rect.rect;
                         assert!(clipped.clip_rect.contains_rect(bounds), "volume clipped at {width}x{height}");
                         assert!(screen.contains_rect(bounds));
                         volume_bounds = Some(bounds);
@@ -1845,5 +2525,85 @@ mod layout_tests {
                 assert!(!bounds.expand(8.0).intersects(volume.expand(8.0)), "controls overlap at {width}x{height}");
             }
         }
+    }
+
+    #[test]
+    fn test_lyrics_parsing_and_toggle() {
+        let lrc_sample = "[ti:Never Say Goodbye]\n[ar:Bon Jovi]\n[al:Slippery When Wet]\n[00:01.00]First line\n[00:05.50]v1: Second line\n[bg:<00:06.46>(Rock it)<00:07.476>]\nPlain third line\nv1:<02:50.856><02:50.856>say\nv1:<03:17.952>Ooh, <03:19.136><03:19.136>and";
+        let parsed = parse_lrc_lines(lrc_sample);
+        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed[0].time_secs, Some(1.0));
+        assert_eq!(parsed[0].text, "First line");
+        assert_eq!(parsed[1].time_secs, Some(5.5));
+        assert_eq!(parsed[1].text, "Second line (Rock it)");
+        assert_eq!(parsed[2].time_secs, None);
+        assert_eq!(parsed[2].text, "Plain third line");
+        assert_eq!(parsed[3].text, "say");
+        assert_eq!(parsed[4].text, "Ooh, and");
+    }
+
+    #[test]
+    fn test_floating_preview_auto_removal() {
+        let ctx = egui::Context::default();
+        let mut app = DeckApp::from_saved(SavedConfig::default(), None);
+        app.hover_transition = 1.0;
+        app.active_floating_control = Some(FloatingControlType::Volume);
+        app.floating_control_timer = 0.01;
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(720.0, 480.0));
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::PointerMoved(pos2(100.0, 100.0))],
+            ..Default::default()
+        }, |ctx| app.update_ui(ctx));
+        assert!(app.active_floating_control.is_none(), "floating control must be removed automatically after timer expires");
+    }
+
+    #[test]
+    fn test_unsynced_lyrics_scroll_no_snap_back() {
+        let ctx = egui::Context::default();
+        let mut app = DeckApp::from_saved(SavedConfig::default(), None);
+        app.lyrics_open = true;
+        app.current_meta = Some(TrackMetadata {
+            title: "Song Without Timestamps".into(),
+            artist: "Artist".into(),
+            duration_secs: 180.0,
+            lyrics: Some("Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\nLine 7\nLine 8\nLine 9\nLine 10".into()),
+            ..Default::default()
+        });
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(720.0, 480.0));
+        
+        // Frame 1: Initial display
+        let _ = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| app.update_ui(ctx));
+        assert_eq!(app.lyrics_user_offset, 0.0);
+        assert_eq!(app.lyrics_user_scroll_timer, 0.0);
+
+        // Frame 2: Mouse wheel scroll over lyrics area (right half of screen)
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pos2(500.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -100.0),
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }, |ctx| app.update_ui(ctx));
+
+        assert!(app.lyrics_user_offset > 0.0, "User scroll offset must advance on wheel scroll");
+        assert_eq!(app.lyrics_user_scroll_timer, 0.0, "Unsynced lyrics must not set snap-back timer");
+        let scrolled_pos = app.lyrics_user_offset;
+
+        // Frame 3: Elapse 5 seconds without scrolling
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(screen),
+            predicted_dt: 5.0,
+            events: vec![egui::Event::PointerMoved(pos2(500.0, 200.0))],
+            ..Default::default()
+        }, |ctx| app.update_ui(ctx));
+
+        // Must still stay at scrolled_pos and NOT snap back to 0.0
+        assert_eq!(app.lyrics_user_offset, scrolled_pos, "Unsynced lyrics position must remain exactly where scrolled");
     }
 }

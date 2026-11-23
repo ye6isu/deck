@@ -43,6 +43,7 @@ pub struct AudioEngine {
     cmd_tx: Sender<Request>,
     status_rx: Receiver<AudioStatus>,
     revision: AtomicU64,
+    wake_callback: Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send + 'static>>>>,
 }
 
 struct Effects {
@@ -300,6 +301,7 @@ impl AudioEngine {
                 cmd_tx,
                 status_rx,
                 revision: AtomicU64::new(0),
+                wake_callback: Arc::new(std::sync::Mutex::new(None)),
             },
             cmd_rx,
             status_tx,
@@ -310,6 +312,8 @@ impl AudioEngine {
         let (cmd_tx, cmd_rx) = unbounded::<Request>();
         let (status_tx, status_rx) = unbounded::<AudioStatus>();
         let (ready_tx, ready_rx) = bounded(1);
+        let wake_callback: Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send + 'static>>>> = Arc::new(std::sync::Mutex::new(None));
+        let wake_cb_clone = Arc::clone(&wake_callback);
         std::thread::Builder::new()
             .name("deck-playback".into())
             .spawn(move || {
@@ -464,6 +468,13 @@ impl AudioEngine {
                         finished,
                         error: error.take(),
                     });
+                    if finished {
+                        if let Ok(guard) = wake_cb_clone.lock() {
+                            if let Some(cb) = guard.as_ref() {
+                                cb();
+                            }
+                        }
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -472,6 +483,7 @@ impl AudioEngine {
             cmd_tx,
             status_rx,
             revision: AtomicU64::new(0),
+            wake_callback,
         })
     }
 
@@ -484,6 +496,12 @@ impl AudioEngine {
         };
         let _ = self.cmd_tx.send(Request { revision, command });
         revision
+    }
+
+    pub fn set_wake_callback<F: Fn() + Send + 'static>(&self, callback: F) {
+        if let Ok(mut guard) = self.wake_callback.lock() {
+            *guard = Some(Box::new(callback));
+        }
     }
 
     pub fn try_recv_status(&self) -> Option<AudioStatus> {
@@ -629,6 +647,7 @@ mod tests {
             cmd_tx,
             status_rx,
             revision: AtomicU64::new(0),
+            wake_callback: Arc::new(std::sync::Mutex::new(None)),
         };
         tx.send(AudioStatus {
             revision: 1,
