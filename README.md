@@ -4,11 +4,11 @@ A fast, hardware-accelerated desktop audio player built with Rust and egui. Play
 
 ## Preview
 
-`deck` dynamically adapts its layout to your window dimensions—seamlessly transitioning between an expanded view with library management and a compact playback deck.
+`deck` dynamically adapts its layout to your window dimensions—seamlessly transitioning between landscape and portrait orientations.
 
-| Full View | Compact View |
+| Landscape View | Portrait View |
 | :---: | :---: |
-| ![Full Mode](docs/images/preview-full.png) | ![Compact Mode](docs/images/preview-compact.png) |
+| ![Landscape Mode](docs/images/preview-landscape.png) | ![Portrait Mode](docs/images/preview-portrait.png) |
 
 ## Features
 
