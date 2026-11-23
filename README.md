@@ -13,7 +13,8 @@ A fast, hardware-accelerated desktop audio player built with Rust and egui. Play
 ## Features
 
 - **Live DSP Engine**: Real-time speed scaling (sped up / slowed down) and studio hall reverb applied on the fly to high-res audio.
-- **Adaptive Layout**: Smooth, dynamic UI scaling that transitions from library view to minimal deck player based on window size.
+- **Synced & Unsynced Lyrics**: Interactive lyrics view with smooth auto-scrolling for timestamped LRC tracks (click-to-seek, auto-snap) and free persistent scrolling for unsynced plain text lyrics.
+- **Adaptive Layout**: Smooth, dynamic UI scaling that transitions seamlessly between landscape and portrait orientations based on window size.
 - **Hardware-Accelerated UI**: Immediate-mode GUI powered by `eframe` and `egui`.
 - **Low-Latency Playback**: High-performance audio pipeline using `rodio` and `symphonia`.
 - **Metadata & Album Art**: Automatic tag extraction and embedded artwork rendering via `lofty`.
